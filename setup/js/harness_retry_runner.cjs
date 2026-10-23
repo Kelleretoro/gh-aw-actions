@@ -2,28 +2,97 @@
 
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const { formatDuration, sleep } = require("./process_runner.cjs");
 const { emitSoftTimeoutSignal } = require("./harness_retry_guard.cjs");
+
+const executionEvidenceEnvVars = ["GH_AW_AWF_EXECUTION_EVIDENCE_FILE", "GH_AW_AWF_EXECUTION_COMPONENT"];
+
+/**
+ * @param {Record<string, string | undefined>} env
+ * @returns {{ evidenceFile?: string, component?: string, runId?: string, runAttempt?: string }}
+ */
+function captureExecutionEvidenceConfiguration(env) {
+  return {
+    evidenceFile: env.GH_AW_AWF_EXECUTION_EVIDENCE_FILE,
+    component: env.GH_AW_AWF_EXECUTION_COMPONENT,
+    runId: env.GITHUB_RUN_ID,
+    runAttempt: env.GITHUB_RUN_ATTEMPT,
+  };
+}
+
+/**
+ * @template {Record<string, string | undefined>} T
+ * @param {T} env
+ * @returns {T}
+ */
+function stripExecutionEvidenceEnv(env) {
+  for (const name of executionEvidenceEnvVars) {
+    delete env[name];
+  }
+  return env;
+}
 
 /**
  * `nextDelayMs` overrides the delay before the immediately next attempt; following retries
  * resume exponential backoff from that delay.
- * @typedef {{ exitCode: number, output: string, hasOutput: boolean, durationMs?: number, watchdogFired?: boolean, runtimeGuardFired?: boolean, runtimeGuardReason?: string, safeOutputsByteOffset?: number }} HarnessAttemptResult
+ * @typedef {{ exitCode: number, output: string, hasOutput: boolean, durationMs?: number, watchdogFired?: boolean, runtimeGuardFired?: boolean, runtimeGuardReason?: string, safeOutputsByteOffset?: number, cancelled?: boolean }} HarnessAttemptResult
  * @typedef {{ action: "retry" | "stop", exitCode?: number, nextDelayMs?: number }} HarnessFailureDecision
  */
 
 /**
  * Return true when the harness should skip spawning an agent because a prior step
  * already wrote a noop safe-output.
- * @param {{ safeOutputsPath: string, hasNoopInSafeOutputs: (path: string, options: { logger: (message: string) => void }) => boolean, log: (message: string) => void }} options
+ * @param {{ safeOutputsPath: string, hasNoopInSafeOutputs: (path: string, options: { logger: (message: string) => void }) => boolean, log: (message: string) => void, executionEvidence?: ReturnType<typeof captureExecutionEvidenceConfiguration> }} options
  * @returns {boolean}
  */
-function shouldSkipForNoopSafeOutputs({ safeOutputsPath, hasNoopInSafeOutputs, log }) {
+function shouldSkipForNoopSafeOutputs({ safeOutputsPath, hasNoopInSafeOutputs, log, executionEvidence }) {
   if (!safeOutputsPath || !hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
     return false;
   }
   log("pre-flight: noop message found in safe-outputs — skipping agent (work is already complete or no work needed)");
+  const evidenceFile = executionEvidence?.evidenceFile;
+  const component = executionEvidence?.component;
+  const runId = executionEvidence?.runId;
+  const runAttempt = executionEvidence?.runAttempt;
+  if (
+    evidenceFile &&
+    path.isAbsolute(evidenceFile) &&
+    typeof component === "string" &&
+    /^[a-z][a-z0-9_-]{0,63}$/.test(component) &&
+    /^\d+$/.test(runId || "") &&
+    /^\d+$/.test(runAttempt || "") &&
+    Number.isSafeInteger(Number(runId)) &&
+    Number(runId) > 0 &&
+    Number.isSafeInteger(Number(runAttempt)) &&
+    Number(runAttempt) > 0
+  ) {
+    try {
+      // Only this pre-flight branch proves no model ran; a noop after an attempt does not.
+      fs.mkdirSync(path.dirname(evidenceFile), { recursive: true });
+      fs.writeFileSync(`${evidenceFile}.tmp`, JSON.stringify({ version: 1, component, run_id: Number(runId), run_attempt: Number(runAttempt), state: "not_started" }) + "\n");
+      fs.renameSync(`${evidenceFile}.tmp`, evidenceFile);
+      log(`pre-flight: recorded ${component} execution evidence as not_started`);
+    } catch (error) {
+      log(`pre-flight: could not record zero-use execution evidence: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   return true;
+}
+
+function runPreflightNoopCheck() {
+  const { hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
+  return shouldSkipForNoopSafeOutputs({
+    safeOutputsPath: process.env.GH_AW_SAFE_OUTPUTS || "",
+    hasNoopInSafeOutputs,
+    log: message => process.stderr.write(`${message}\n`),
+    executionEvidence: captureExecutionEvidenceConfiguration(process.env),
+  });
+}
+
+if (require.main === module && process.argv[2] === "--preflight-noop") {
+  process.exitCode = runPreflightNoopCheck() ? 0 : 1;
 }
 
 /**
@@ -76,8 +145,9 @@ async function runHarnessRetryLoop(options) {
 
     if (attempt > 0) {
       const retryMode = options.getRetryMode ? options.getRetryMode(attempt) : "fresh run";
-      options.log(`retry ${attempt}/${options.maxRetries}: sleeping ${delay}ms before next attempt (${retryMode})`);
-      await sleepFor(delay);
+      const sleepDelay = options.softTimeoutGuard ? Math.min(delay, Math.max(0, options.softTimeoutGuard.softDeadlineMs - Date.now())) : delay;
+      options.log(`retry ${attempt}/${options.maxRetries}: sleeping ${sleepDelay}ms before next attempt (${retryMode})`);
+      await sleepFor(sleepDelay);
       delay = Math.min(delay * options.backoffMultiplier, options.maxDelayMs);
       options.log(`retry ${attempt}/${options.maxRetries}: woke up, next delay will be ${delay}ms`);
       if (options.softTimeoutGuard && Date.now() >= options.softTimeoutGuard.softDeadlineMs) {
@@ -91,6 +161,11 @@ async function runHarnessRetryLoop(options) {
     const result = await options.runAttempt(attempt);
     lastResult = result;
     lastExitCode = result.exitCode;
+
+    if (result.cancelled) {
+      options.log(`attempt ${attempt + 1}: cancelled — not retrying`);
+      break;
+    }
 
     if (result.exitCode === 0) {
       options.log(`success on attempt ${attempt + 1}: totalDuration=${formatDuration(Date.now() - options.driverStartTime)}`);
@@ -116,8 +191,11 @@ async function runHarnessRetryLoop(options) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    captureExecutionEvidenceConfiguration,
     runHarnessRetryLoop,
+    runPreflightNoopCheck,
     shouldSkipForNoopSafeOutputs,
     shouldStopForNoopSafeOutputs,
+    stripExecutionEvidenceEnv,
   };
 }

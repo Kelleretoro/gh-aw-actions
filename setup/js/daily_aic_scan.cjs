@@ -3,31 +3,22 @@
 const fs = require("fs");
 const path = require("path");
 const { AIC_SCAN_CACHE_FILE_PATH, readScanCache, matchesCompletedRun, scanCacheEntry } = require("./daily_aic_cache_helpers.cjs");
+const { API_READ_OPERATIONS, getErrorStatus, isQuotaError, isTransientError, safeResponseHeaders, getAPIReadFailure, withQuotaResetRecovery } = require("./daily_aic_api_budget.cjs");
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_PAGES = 25;
-
-function getErrorStatus(error) {
-  if (!error || typeof error !== "object") return 0;
-  const record = /** @type {Record<string, unknown>} */ error;
-  const directStatus = Number(record.status || 0);
-  if (directStatus) return directStatus;
-  if (!record.response || typeof record.response !== "object") return 0;
-  return Number(/** @type {Record<string, unknown>} */ record.response.status || 0);
-}
 
 /**
  * The run listing is authoritative for window membership and attempt identity.
  * Publish only individually resolved observations, including nonzero usage.
  * Missing entries and concurrent snapshots are safe misses, never zero usage.
  */
-async function scanDailyAIC({ github, context, budget, artifactClient, getRunAIC, listPage, token, fallbackAIC = 0, cachePath = AIC_SCAN_CACHE_FILE_PATH, now = Date.now() }) {
+async function scanDailyAICOnce({ github, context, budget, artifactClient, getRunAIC, listPage, token, fallbackAIC = 0, cachePath = AIC_SCAN_CACHE_FILE_PATH, now = Date.now() }) {
   const { owner, repo } = context.repo;
   const repository = `${owner}/${repo}`;
-  const currentResponse = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: context.runId });
-  budget.observe(currentResponse);
+  const currentResponse = await budget.request(() => github.rest.actions.getWorkflowRun({ owner, repo, run_id: context.runId }), true, API_READ_OPERATIONS.CURRENT_RUN);
   const current = currentResponse.data;
-  if (!current.workflow_id) throw new Error("Cannot resolve the daily AIC workflow");
+  if (!Number.isSafeInteger(current?.workflow_id) || current.workflow_id <= 0) throw new Error("Cannot resolve the daily AIC workflow");
   core.info(
     `[daily-workflow-aic] Started authoritative AIC scan: ${JSON.stringify({
       repository,
@@ -43,18 +34,22 @@ async function scanDailyAIC({ github, context, budget, artifactClient, getRunAIC
   let lookupMode = "workflow_id";
   const created = `>=${new Date(now - WINDOW_MS).toISOString()}`;
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const result = await listPage(github, {
-      owner,
-      repo,
-      workflowId: current.workflow_id,
-      created,
-      page,
-      perPage: 100,
-      lookupMode,
-    });
-    budget.observe(result.response);
+    const result = await listPage(
+      github,
+      {
+        owner,
+        repo,
+        workflowId: current.workflow_id,
+        created,
+        page,
+        perPage: 100,
+        lookupMode,
+      },
+      budget
+    );
     lookupMode = result.lookupMode;
-    const pageRuns = result.response.data.workflow_runs || [];
+    const pageRuns = result.response.data?.workflow_runs;
+    if (!Array.isArray(pageRuns)) throw new Error("Incomplete daily AIC workflow history");
     core.info(
       `[daily-workflow-aic] Listed workflow run candidates: ${JSON.stringify({
         page,
@@ -64,6 +59,7 @@ async function scanDailyAIC({ github, context, budget, artifactClient, getRunAIC
       })}`
     );
     for (const run of pageRuns) {
+      if (!Number.isSafeInteger(run?.id) || run.id <= 0) throw new Error("A workflow run has an invalid identity");
       if (run.id === context.runId) continue;
       const created = Date.parse(run.created_at);
       if (!Number.isFinite(created)) throw new Error("A workflow run has an unknown creation time");
@@ -91,7 +87,7 @@ async function scanDailyAIC({ github, context, budget, artifactClient, getRunAIC
   try {
     for (const run of candidates.values()) {
       const cached = entries.get(run.id);
-      const hit = matchesCompletedRun(cached, run);
+      const hit = matchesCompletedRun(cached, run) && cached.source === "recorded";
       core.info(
         `[daily-workflow-aic] Resolving run AIC: ${JSON.stringify({
           runId: run.id,
@@ -102,43 +98,53 @@ async function scanDailyAIC({ github, context, budget, artifactClient, getRunAIC
       );
       let aic;
       let reason;
+      let source;
+      let accountingReason;
       if (hit) {
         aic = cached.aic;
         reason = "scan_cache";
+        source = "recorded";
+        accountingReason = cached.accountingReason;
       } else {
         try {
-          aic = await getRunAIC(artifactClient, run.id, token, owner, repo, run, { github, budget });
+          const inspection = { github, budget, accountingReason: undefined };
+          aic = await getRunAIC(artifactClient, run.id, token, owner, repo, run, inspection);
+          accountingReason = inspection.accountingReason;
           reason = "artifact_accounting";
+          source = "recorded";
         } catch (error) {
           const status = getErrorStatus(error);
-          const canUseFallback = Number.isFinite(fallbackAIC) && fallbackAIC > 0 && !status;
+          const canUseFallback = Number.isFinite(fallbackAIC) && fallbackAIC > 0 && !isQuotaError(error) && safeResponseHeaders(error?.response?.headers)["retry-after"] == null && (!status || isTransientError(error));
           core.info(
             `[daily-workflow-aic] Run AIC resolution failed: ${JSON.stringify({
               runId: run.id,
               runAttempt: run.run_attempt,
               status: status || null,
-              error: error instanceof Error ? error.message : String(error),
+              error: getAPIReadFailure(error) || (error instanceof Error ? error.message : String(error)),
               fallbackAvailable: canUseFallback,
             })}`
           );
           if (!canUseFallback) throw error;
           aic = fallbackAIC;
           reason = "max_ai_credits_fallback";
+          source = "estimated";
           core.warning(
             `[daily-workflow-aic] Assuming max AI Credits after all accounting sources failed: ${JSON.stringify({
               runId: run.id,
               runAttempt: run.run_attempt,
               assumedAIC: aic,
+              error: error instanceof Error ? error.message : String(error),
+              hint: "Check the artifact discovery/download diagnostics above. This is a conservative estimate, not measured usage or provider billing.",
             })}`
           );
         }
       }
-      entries.set(run.id, scanCacheEntry(run, aic, repository, current.workflow_id, now));
+      entries.set(run.id, { ...scanCacheEntry(run, aic, repository, current.workflow_id, now, source), accountingReason });
       if (hit) {
         cacheHits++;
       }
       core.info(`[daily-workflow-aic] Computed run AIC: ${JSON.stringify({ runId: run.id, aic, reason })}`);
-      countedRuns.push({ ...run, aic });
+      countedRuns.push({ ...run, aic, source, accountingReason });
     }
   } finally {
     // This runs even after an API error. Partial snapshots accelerate recovery but
@@ -149,6 +155,10 @@ async function scanDailyAIC({ github, context, budget, artifactClient, getRunAIC
   }
   core.info(`[daily-workflow-aic] Completed authoritative AIC scan: ${JSON.stringify({ candidateRuns: candidates.size, countedRuns: countedRuns.length, cacheHits })}`);
   return { countedRuns, candidateRunsCount: candidates.size, cacheHits, current };
+}
+
+async function scanDailyAIC(options) {
+  return withQuotaResetRecovery(() => scanDailyAICOnce(options), options.recovery);
 }
 
 module.exports = { scanDailyAIC };

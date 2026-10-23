@@ -36,10 +36,15 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 const { renderLogToStdout } = require("./render_log_to_stdout.cjs");
-const { withRetry } = require("./error_recovery.cjs");
 const { lstatGuard } = require("./symlink_guard.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
+const { applyGatewayRuntimeTimeouts } = require("./tool_timeouts.cjs");
+const { fetchMCPToolsResult } = require("./mount_mcp_as_cli.cjs");
+const { writeMcpConfiguration } = require("./mcp_configuration.cjs");
+const { PROXY_ENV_NAMES } = require("./constants.cjs");
+const { redactCliProxyDiagnostics } = require("./redact_cli_proxy_diagnostics.cjs");
+const { prepareMCPServerCAs } = require("./mcp_server_ca.cjs");
 
 /** @type {number | null} */
 let activeGatewayPid = null;
@@ -52,6 +57,43 @@ const CONTAINER_STATUS_TIMEOUT_MS = getSetupTimeoutMs("mcpContainerStatus");
 const CONFIG_CONVERTER_TIMEOUT_MS = getSetupTimeoutMs("mcpConfigConverter");
 const DOCKER_CLEANUP_TIMEOUT_MS = getSetupTimeoutMs("mcpDockerCleanup");
 const MCP_SERVER_CHECK_TIMEOUT_MS = getSetupTimeoutMs("mcpServerCheck");
+
+/**
+ * Retries startup probes without letting requests or backoff extend the shared
+ * container startup deadline.
+ *
+ * @param {(remainingMs: number) => Promise<void>} probe
+ * @param {ReturnType<typeof resolveGatewayHealthRetryConfig>} retryConfig
+ * @param {number} deadline
+ * @param {string} label
+ * @param {(err: any) => boolean} [shouldRetry]
+ */
+async function retryGatewayStartup(probe, retryConfig, deadline, label, shouldRetry = () => true) {
+  let delayMs = retryConfig.initialDelayMs;
+  for (let attempt = 1; attempt <= retryConfig.maxTotalAttempts; attempt += 1) {
+    const remainingMs = deadline - nowMs();
+    if (remainingMs <= 0) {
+      throw new Error(`${label} startup deadline exceeded`);
+    }
+    try {
+      await probe(remainingMs);
+      if (nowMs() >= deadline) {
+        throw new Error(`${label} startup deadline exceeded`);
+      }
+      return;
+    } catch (err) {
+      if (!shouldRetry(err) || attempt === retryConfig.maxTotalAttempts || nowMs() >= deadline) {
+        throw err;
+      }
+      delayMs = Math.min(delayMs * retryConfig.backoffMultiplier, retryConfig.maxDelayMs);
+      const sleepMs = Math.min(Math.ceil(delayMs), deadline - nowMs());
+      if (attempt === 1 || (attempt & (attempt - 1)) === 0) {
+        core.warning(`${label}: retrying after attempt ${attempt} in ${sleepMs}ms`);
+      }
+      await sleep(sleepMs);
+    }
+  }
+}
 
 /**
  * Default health-check retry parameters. The defaults give the gateway a retry
@@ -77,7 +119,7 @@ const MCP_GATEWAY_HEALTH_RETRY_ENV = Object.freeze({
 /** Default MCP backend startup timeout the retry budget must outlast. */
 const MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_DEFAULT_MS = 120_000;
 
-/** Upper bound on configurable health-check attempts, to keep the wait finite. */
+/** Upper bound on explicit and automatically sized health-check attempts. */
 const MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT = 10_000;
 
 /**
@@ -94,38 +136,46 @@ const MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS = 25_000;
  * @param {number} defaultValue
  * @param {NodeJS.ProcessEnv} env
  * @param {{ integer?: boolean }} [options]
- * @returns {number}
+ * @returns {{ value: number, wasExplicit: boolean }}
  */
 function readPositiveEnvNumber(envName, defaultValue, env, options = {}) {
   const raw = env[envName];
   if (raw === undefined || !raw.trim()) {
-    return defaultValue;
+    return { value: defaultValue, wasExplicit: false };
   }
   const parsed = Number(raw.trim());
   const isValid = Number.isFinite(parsed) && parsed > 0 && (!options.integer || Number.isSafeInteger(parsed));
   if (!isValid) {
     core.warning(`Ignoring invalid ${envName}='${raw}': expected a positive ${options.integer ? "integer" : "number"}, using ${defaultValue}`);
-    return defaultValue;
+    return { value: defaultValue, wasExplicit: false };
   }
-  return parsed;
+  return { value: parsed, wasExplicit: true };
 }
 
 /**
- * Computes the cumulative retry delay withRetry will spend before exhausting
- * its attempts. withRetry applies the backoff multiplier before its first sleep,
+ * Computes a lower bound on the cumulative startup retry delay before exhausting
+ * its attempts. Actual sleeps round up to avoid Node truncating fractional delays.
+ * The retry loop applies the backoff multiplier before its first sleep,
  * so the first retry waits initialDelayMs * backoffMultiplier.
  *
  * @param {{ maxTotalAttempts: number, initialDelayMs: number, maxDelayMs: number, backoffMultiplier: number }} config
  * @returns {number}
  */
 function computeHealthRetryBudgetMs(config) {
-  let delayMs = config.initialDelayMs;
-  let budgetMs = 0;
-  for (let retry = 1; retry < config.maxTotalAttempts; retry += 1) {
-    delayMs = Math.min(delayMs * config.backoffMultiplier, config.maxDelayMs);
-    budgetMs += delayMs;
+  const retries = config.maxTotalAttempts - 1;
+  if (retries <= 0) {
+    return 0;
   }
-  return budgetMs;
+  if (config.backoffMultiplier === 1) {
+    return Math.min(config.initialDelayMs, config.maxDelayMs) * retries;
+  }
+
+  // Sum the exponential ramp and capped tail without iterating over potentially
+  // millions of attempts. expm1 preserves precision for multipliers close to 1.
+  const logMultiplier = Math.log(config.backoffMultiplier);
+  const rampRetries = Math.min(retries, Math.max(0, Math.ceil(Math.log(config.maxDelayMs / config.initialDelayMs) / logMultiplier) - 1));
+  const rampBudgetMs = rampRetries === 0 ? 0 : (config.initialDelayMs * config.backoffMultiplier * Math.expm1(rampRetries * logMultiplier)) / (config.backoffMultiplier - 1);
+  return rampBudgetMs + (retries - rampRetries) * config.maxDelayMs;
 }
 
 /**
@@ -136,11 +186,13 @@ function computeHealthRetryBudgetMs(config) {
  * @returns {{ maxTotalAttempts: number, initialDelayMs: number, maxDelayMs: number, backoffMultiplier: number, backendStartupTimeoutMs: number, retryBudgetMs: number }}
  */
 function resolveGatewayHealthRetryConfig(env = process.env) {
-  let maxTotalAttempts = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.maxTotalAttempts, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.maxTotalAttempts, env, { integer: true });
-  const initialDelayMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.initialDelayMs, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.initialDelayMs, env, { integer: true });
-  let maxDelayMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.maxDelayMs, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.maxDelayMs, env, { integer: true });
-  let backoffMultiplier = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.backoffMultiplier, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.backoffMultiplier, env);
-  const backendStartupTimeoutMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.backendStartupTimeoutMs, MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_DEFAULT_MS, env, { integer: true });
+  const maxAttemptsOverride = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.maxTotalAttempts, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.maxTotalAttempts, env, { integer: true });
+  let maxTotalAttempts = maxAttemptsOverride.value;
+  const hasExplicitAttempts = maxAttemptsOverride.wasExplicit;
+  const initialDelayMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.initialDelayMs, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.initialDelayMs, env, { integer: true }).value;
+  let maxDelayMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.maxDelayMs, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.maxDelayMs, env, { integer: true }).value;
+  let backoffMultiplier = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.backoffMultiplier, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.backoffMultiplier, env).value;
+  const backendStartupTimeoutMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.backendStartupTimeoutMs, MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_DEFAULT_MS, env, { integer: true }).value;
 
   if (maxTotalAttempts > MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT) {
     core.warning(`${MCP_GATEWAY_HEALTH_RETRY_ENV.maxTotalAttempts}=${maxTotalAttempts} exceeds the supported maximum, using ${MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT}`);
@@ -154,7 +206,7 @@ function resolveGatewayHealthRetryConfig(env = process.env) {
     backoffMultiplier = 1;
   }
 
-  // withRetry caps every delay at maxDelayMs, so a smaller cap than the initial
+  // The retry loop caps every delay at maxDelayMs, so a smaller cap than the initial
   // delay would silently shorten the first sleep.
   if (maxDelayMs < initialDelayMs) {
     core.warning(`${MCP_GATEWAY_HEALTH_RETRY_ENV.maxDelayMs}=${maxDelayMs} is below ${MCP_GATEWAY_HEALTH_RETRY_ENV.initialDelayMs}=${initialDelayMs}, using ${initialDelayMs}`);
@@ -162,9 +214,25 @@ function resolveGatewayHealthRetryConfig(env = process.env) {
   }
 
   const config = { maxTotalAttempts, initialDelayMs, maxDelayMs, backoffMultiplier, backendStartupTimeoutMs };
-  const retryBudgetMs = computeHealthRetryBudgetMs(config);
-
   const requiredBudgetMs = backendStartupTimeoutMs + MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS;
+  let retryBudgetMs = computeHealthRetryBudgetMs(config);
+  if (!hasExplicitAttempts && retryBudgetMs < requiredBudgetMs) {
+    const firstDelayMs = Math.min(initialDelayMs * backoffMultiplier, maxDelayMs);
+    let lower = maxTotalAttempts;
+    // Bound automatic sizing to prevent very frequent polling from exploding.
+    let upper = MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT;
+    while (lower < upper) {
+      const middle = lower + Math.floor((upper - lower) / 2);
+      if (computeHealthRetryBudgetMs({ ...config, maxTotalAttempts: middle }) < requiredBudgetMs) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    config.maxTotalAttempts = lower;
+    retryBudgetMs = computeHealthRetryBudgetMs(config);
+  }
+
   if (retryBudgetMs < requiredBudgetMs) {
     core.warning(
       `MCP gateway health retry budget is ${Math.round(retryBudgetMs / 1000)}s, which is below the ${Math.round(requiredBudgetMs / 1000)}s needed for the ${Math.round(backendStartupTimeoutMs / 1000)}s backend startup timeout plus cleanup and registration; the health check may give up before the gateway is ready`
@@ -172,6 +240,82 @@ function resolveGatewayHealthRetryConfig(env = process.env) {
   }
 
   return Object.freeze({ ...config, retryBudgetMs });
+}
+
+/**
+ * Process health alone does not guarantee that the safe-output backend has
+ * registered its tools. Probe the live backend before permitting agent startup.
+ *
+ * @param {Record<string, unknown>} config
+ * @param {string | undefined} gatewayPort
+ * @param {string | undefined} agentId
+ * @param {ReturnType<typeof resolveGatewayHealthRetryConfig>} retryConfig
+ * @param {number} [startupStartMs]
+ * @returns {Promise<void>}
+ */
+async function waitForSafeOutputsReadiness(config, gatewayPort, agentId, retryConfig, startupStartMs = nowMs()) {
+  const servers = config.mcpServers;
+  const serverName = servers && typeof servers === "object" && ["safeoutputs", "safe-outputs"].find(name => Object.hasOwn(servers, name));
+  if (!serverName) {
+    return;
+  }
+  if (!gatewayPort || !/^\d+$/.test(gatewayPort)) {
+    throw new Error("MCP gateway safeoutputs readiness requires a numeric MCP_GATEWAY_PORT");
+  }
+  if (!agentId) {
+    throw new Error("MCP gateway safeoutputs readiness requires MCP_GATEWAY_AGENT_ID");
+  }
+
+  const serverUrl = `http://localhost:${gatewayPort}/mcp/${serverName}`;
+  const deadline = startupStartMs + retryConfig.backendStartupTimeoutMs + MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS;
+  let attempts = 0;
+  let permanentFailure = false;
+  let insufficientBudget = false;
+  let lastProbe = "shared startup deadline exceeded";
+  core.info("Waiting for MCP gateway safeoutputs tool registration...");
+  try {
+    await retryGatewayStartup(
+      async remainingMs => {
+        // Reserve at least 250ms for each of the three handshake requests.
+        if (remainingMs < 750) {
+          insufficientBudget = true;
+          lastProbe = "insufficient startup budget for a readiness probe (requires at least 750ms)";
+          throw new Error(lastProbe);
+        }
+        attempts += 1;
+        // Each probe performs at most three HTTP requests.
+        const result = await fetchMCPToolsResult(serverUrl, agentId, core, Math.min(2000, Math.floor(remainingMs / 3)));
+        lastProbe = result.failure
+          ? `${result.failure.phase} failed (${result.failure.statusCode !== undefined ? `HTTP ${result.failure.statusCode}` : result.failure.code || "transport error"})`
+          : result.tools.length === 0
+            ? "tools/list has no registered tools"
+            : "shared startup deadline exceeded after tools/list";
+        permanentFailure = !result.emptyWasSuccessful && !result.retryable;
+        if (permanentFailure) {
+          throw new Error("safeoutputs authentication or protocol failure");
+        }
+        if (result.tools.length === 0) {
+          throw new Error("safeoutputs tools/list has no registered tools");
+        }
+        if (nowMs() < deadline) {
+          core.info(`MCP gateway safeoutputs is ready with ${result.tools.length} tool(s) after ${attempts} attempt(s)`);
+        }
+      },
+      retryConfig,
+      deadline,
+      "MCP gateway safeoutputs readiness",
+      () => !permanentFailure && !insufficientBudget
+    );
+  } catch (err) {
+    throw new Error(
+      `MCP gateway safeoutputs readiness failed after ${attempts} attempt(s): ` +
+        (permanentFailure
+          ? "permanent authentication or MCP protocol failure. The agent will not start. Check gateway credentials and MCP backend configuration."
+          : "no tools registered or backend unavailable. The agent will not start. Check MCP gateway startup logs for connection resets (ECONNRESET) or delayed backend registration.") +
+        ` Last probe: ${lastProbe}.`,
+      { cause: err }
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,18 +395,16 @@ const gatewayCredentialRedactions = [
   { pattern: /(Bearer\s+)\S+/gi, replacement: "$1[REDACTED]" },
   { pattern: /((?:agent[_-]?id|api[_-]?key|token|secret|password|authorization)"?\s*[:=]\s*"?)[^\s,}"]+/gi, replacement: "$1[REDACTED]" },
 ];
+const gatewayInternalProxyHosts = ["host.docker.internal", "awf-enclave-mcp"];
 
 /**
  * Redacts common credential formats from gateway diagnostics output.
  * @param {string} text
+ * @param {NodeJS.ProcessEnv} env
  * @returns {string}
  */
-function redactGatewayDiagnostics(text) {
-  let redacted = text;
-  for (const { pattern, replacement } of gatewayCredentialRedactions) {
-    redacted = redacted.replace(pattern, replacement);
-  }
-  return redacted;
+function redactGatewayDiagnostics(text, env = process.env) {
+  return redactCliProxyDiagnostics(text, env, gatewayCredentialRedactions);
 }
 
 /**
@@ -352,6 +494,29 @@ function injectCustomGatewayEnvArgs(args, env = process.env) {
   // impossible even if the compiler/runtime metadata ever diverges.
   const customArgs = names.flatMap((name, index) => ["-e", `${name}=${env[`${customGatewayEnvTransportPrefix}${index}`] || ""}`]);
   return [...args.slice(0, markerIndex), ...customArgs, ...args.slice(markerIndex + 1)];
+}
+
+/**
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+function injectProxyEnvArgs(args, env = process.env) {
+  const noProxyNames = PROXY_ENV_NAMES.filter(name => name.toLowerCase() === "no_proxy" && env[name] !== undefined);
+  if (PROXY_ENV_NAMES.some(name => name.toLowerCase() !== "no_proxy" && env[name]) && noProxyNames.length === 0) {
+    noProxyNames.push("NO_PROXY");
+  }
+  for (const name of noProxyNames) {
+    const value = env[name] || "";
+    const exclusions = new Set(value.split(",").map(host => host.trim().toLowerCase()));
+    const missingHosts = gatewayInternalProxyHosts.filter(host => !exclusions.has(host));
+    if (missingHosts.length > 0) {
+      env[name] = `${value}${value && !value.endsWith(",") ? "," : ""}${missingHosts.join(",")}`;
+    }
+  }
+  const proxyArgs = PROXY_ENV_NAMES.filter(name => env[name] !== undefined).flatMap(name => ["-e", name]);
+  // Insert after "run" so explicitly configured container settings still win.
+  return [...args.slice(0, 1), ...proxyArgs, ...args.slice(1)];
 }
 
 /**
@@ -556,6 +721,8 @@ function stopGatewayProcess(pid) {
  * @returns {Promise<{ statusCode: number; body: string }>}
  */
 function httpGet(url, timeoutMs) {
+  /** @type {NodeJS.Timeout | undefined} */
+  let timeout;
   return new Promise((resolve, reject) => {
     const req = http.get(url, { timeout: timeoutMs }, res => {
       let data = "";
@@ -564,11 +731,12 @@ function httpGet(url, timeoutMs) {
       res.on("end", () => resolve({ statusCode: res.statusCode || 0, body: data }));
     });
     req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("timeout"));
+      req.destroy(new Error("timeout"));
     });
     req.on("error", reject);
-  });
+    // Socket inactivity timeouts alone do not bound a slowly streaming body.
+    timeout = setTimeout(() => req.destroy(new Error("timeout")), timeoutMs);
+  }).finally(() => clearTimeout(timeout));
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +943,8 @@ async function main() {
   const configReadStart = nowMs();
   let mcpConfig;
   try {
-    mcpConfig = fs.readFileSync(0, "utf8"); // fd 0 = stdin
+    // Avoid Node's UTF-8 pipe short-read overflow (nodejs/node#66341).
+    mcpConfig = fs.readFileSync(0).toString("utf8");
   } catch (err) {
     throw new Error(`Failed to read MCP configuration from stdin: ${getErrorMessage(err)}`, { cause: err });
   }
@@ -785,12 +954,6 @@ async function main() {
     mcpConfig = normalizedConfig;
   }
   printTiming(configReadStart, "Configuration read from stdin");
-  core.info("");
-
-  // Log configuration for debugging
-  core.info("-------START MCP CONFIG-----------");
-  core.info(mcpConfig);
-  core.info("-------END MCP CONFIG-----------");
   core.info("");
 
   // -----------------------------------------------------------------------
@@ -806,21 +969,9 @@ async function main() {
     core.error("");
     core.error("JSON validation error:");
     const parseMessage = getErrorMessage(err);
-    core.error(parseMessage);
     const parseContext = getJSONParseErrorContext(mcpConfig, parseMessage);
     if (parseContext) {
       core.error(`Likely offending location: line ${parseContext.line}, column ${parseContext.column}`);
-      if (parseContext.key) {
-        core.error(`Likely offending key: ${parseContext.key}`);
-      }
-      core.error(`Context line: ${parseContext.lineText}`);
-    }
-    core.error("");
-    core.error("Configuration content:");
-    const lines = mcpConfig.split("\n");
-    core.error(lines.slice(0, 50).join("\n"));
-    if (lines.length > 50) {
-      core.error("... (truncated, showing first 50 lines)");
     }
     core.setFailed("ERROR: Configuration is not valid JSON");
     return;
@@ -834,6 +985,10 @@ async function main() {
     core.setFailed("ERROR: Configuration is missing required 'gateway' section");
     return;
   }
+  applyAgenticWorkflowsRunnerIdentity(configObj);
+  applyGatewayRuntimeTimeouts(configObj, process.env);
+  const caMountArgs = prepareMCPServerCAs(configObj);
+  mcpConfig = JSON.stringify(configObj);
   if (!("port" in gw) || gw.port == null) {
     core.setFailed("ERROR: Gateway configuration is missing required 'port' field");
     return;
@@ -850,6 +1005,9 @@ async function main() {
 
   applyOTLPIgnoreIfMissing(configObj);
 
+  const logDir = "/tmp/gh-aw/mcp-logs/";
+  writeMcpConfiguration(logDir, configObj);
+
   // Servers declared with `required: false` are best-effort: a failed startup
   // connectivity check for them must not abort the whole gateway.
   const optionalServerNames = extractOptionalServerNames(configObj);
@@ -864,7 +1022,6 @@ async function main() {
   // -----------------------------------------------------------------------
   // Start gateway container
   // -----------------------------------------------------------------------
-  const logDir = "/tmp/gh-aw/mcp-logs/";
   const outputPath = path.join(configDir, "gateway-output.json");
   const gatewayStartupMarker = getGatewayStartupMarkerPath();
   clearGatewayStartupMarker(gatewayStartupMarker);
@@ -896,7 +1053,11 @@ async function main() {
     core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND did not contain an executable command");
     return;
   }
-  args = injectCustomGatewayEnvArgs(args);
+  const gatewayEnv = { ...process.env };
+  // Insert before all existing flags and the image, never into the command string.
+  args.splice(1, 0, ...caMountArgs);
+  args = injectCustomGatewayEnvArgs(args, gatewayEnv);
+  args = injectProxyEnvArgs(args, gatewayEnv);
 
   const outputFd = fs.openSync(outputPath, "w", 0o600);
   const stderrPath = createGatewayStderrPath();
@@ -904,7 +1065,7 @@ async function main() {
 
   const child = spawn(cmd, args, {
     stdio: ["pipe", outputFd, stderrFd],
-    env: { ...process.env, MCP_GATEWAY_LOG_DIR: logDir },
+    env: { ...gatewayEnv, MCP_GATEWAY_LOG_DIR: logDir },
     detached: true,
   });
   child.on("error", err => {
@@ -981,8 +1142,7 @@ async function main() {
   core.info("");
 
   const maxTotalAttempts = healthRetryConfig.maxTotalAttempts;
-  // withRetry's maxRetries excludes the initial attempt.
-  const maxRetryCount = maxTotalAttempts - 1;
+  const startupDeadline = gatewayStartTime + healthRetryConfig.backendStartupTimeoutMs + MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS;
   let httpCode = 0;
   let healthBody = "";
   let succeeded = false;
@@ -990,8 +1150,8 @@ async function main() {
 
   core.info("=== Health Check Progress ===");
   try {
-    await withRetry(
-      async () => {
+    await retryGatewayStartup(
+      async remainingMs => {
         // Counts total health-check attempts, including the final successful attempt.
         attemptsMade += 1;
         const elapsedSec = Math.floor((nowMs() - healthCheckStart) / 1000);
@@ -999,27 +1159,21 @@ async function main() {
           core.info(`Attempt ${attemptsMade}/${maxTotalAttempts} (${elapsedSec}s elapsed)...`);
         }
 
-        const res = await httpGet(healthUrl, 2000);
+        const res = await httpGet(healthUrl, Math.min(2000, remainingMs));
         httpCode = res.statusCode;
         healthBody = res.body;
         if (httpCode === 200 && healthBody) {
           core.info(`✓ Health check succeeded on attempt ${attemptsMade} (${elapsedSec}s elapsed)`);
-          succeeded = true;
           return;
         }
         throw new Error(`Health endpoint not ready (HTTP ${httpCode || 0})`);
       },
-      {
-        maxRetries: maxRetryCount,
-        initialDelayMs: healthRetryConfig.initialDelayMs,
-        maxDelayMs: healthRetryConfig.maxDelayMs,
-        backoffMultiplier: healthRetryConfig.backoffMultiplier,
-        jitterMs: 0,
-        // Preserve previous loop behavior: retry any health-check failure until attempts are exhausted.
-        shouldRetry: () => true,
-      },
-      "MCP gateway health check"
+      healthRetryConfig,
+      startupDeadline,
+      "MCP gateway health check",
+      () => isProcessAlive(gatewayPid)
     );
+    succeeded = true;
   } catch {
     // Retry exhaustion is ignored here; handled below using existing diagnostics.
   }
@@ -1036,8 +1190,14 @@ async function main() {
   }
 
   if (succeeded) {
-    core.info("Gateway is ready!");
     printTiming(healthCheckStart, "Health check wait");
+    const safeOutputsReadinessStart = nowMs();
+    try {
+      await waitForSafeOutputsReadiness(configObj, gatewayPort, agentId, healthRetryConfig, gatewayStartTime);
+    } finally {
+      printTiming(safeOutputsReadinessStart, "Safe outputs readiness wait");
+    }
+    core.info("Gateway is ready!");
     writeGatewayStartupMarker(gatewayStartupMarker);
   } else {
     core.error("");
@@ -1177,6 +1337,7 @@ async function main() {
     codex: "convert_gateway_config_codex.cjs",
     claude: "convert_gateway_config_claude.cjs",
     gemini: "convert_gateway_config_gemini.cjs",
+    pi: "convert_gateway_config_pi.cjs",
   };
 
   // Engines can declare a "mcp.config-adapter" script in their behaviors definition
@@ -1378,7 +1539,40 @@ if (require.main === module) {
   });
 }
 
+/**
+ * Backend containers do not inherit the gateway container's Docker user.
+ * Keep private downloaded logs runner-owned so artifact redaction can read them.
+ * @param {Record<string, unknown>} config
+ * @param {number | undefined} [uid]
+ * @param {number | undefined} [gid]
+ */
+function applyAgenticWorkflowsRunnerIdentity(config, uid = process.getuid?.(), gid = process.getgid?.()) {
+  const servers = config.mcpServers;
+  if (!servers || typeof servers !== "object" || !("agenticworkflows" in servers)) return;
+  const server = servers.agenticworkflows;
+  if (!server || typeof server !== "object" || !("container" in server) || typeof server.container !== "string" || !server.container) return;
+  const args = "args" in server ? server.args : [];
+  if (!Array.isArray(args) || !args.every(arg => typeof arg === "string")) {
+    throw new Error("Invalid agenticworkflows container arguments");
+  }
+  // Docker parses any suffix after -u as a username or UID, including -uroot.
+  if (args.some(arg => arg === "--user" || arg === "-u" || arg.startsWith("--user=") || (arg.startsWith("-u") && !arg.startsWith("--")))) return;
+  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid === undefined || gid === undefined || uid < 0 || gid < 0) {
+    throw new Error("Runner identity is required for the agenticworkflows container");
+  }
+  const env = "env" in server ? server.env : {};
+  if (!env || typeof env !== "object" || Array.isArray(env)) {
+    throw new Error("Invalid agenticworkflows container environment");
+  }
+  Object.assign(server, {
+    args: [...args, "--user", `${uid}:${gid}`],
+    // /tmp is private to this backend container; /root is not writable as the runner.
+    env: { HOME: "/tmp", ...env },
+  });
+}
+
 module.exports = {
+  applyAgenticWorkflowsRunnerIdentity,
   applyOTLPIgnoreIfMissing,
   clearGatewayStartupMarker,
   createGatewayStderrPath,
@@ -1393,6 +1587,7 @@ module.exports = {
   getJSONParseErrorContext,
   getGatewayStartupMarkerPath,
   injectCustomGatewayEnvArgs,
+  injectProxyEnvArgs,
   computeHealthRetryBudgetMs,
   MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT,
   MCP_GATEWAY_HEALTH_RETRY_DEFAULTS,
@@ -1404,5 +1599,8 @@ module.exports = {
   redactGatewayDiagnostics,
   resolveCopilotConfigPaths,
   validateGatewayAgentIdentifiers,
+  waitForSafeOutputsReadiness,
+  retryGatewayStartup,
+  httpGet,
   writeGatewayStartupMarker,
 };

@@ -15,7 +15,7 @@
  * Cache-read and cache-write fields are intentionally not added: token-usage
  * records already expose gh-aw's normalized logical input count.
  *
- * @param {any[]} entries
+ * @param {Iterable<any>} entries
  * @param {number} [initialIgnoredRecords]
  * @returns {{ workingSet: WorkingSetMetrics, ignoredRecords: number }}
  */
@@ -69,21 +69,13 @@ function calculateWorkingSetFromEntries(entries, initialIgnoredRecords = 0) {
  * @returns {{ workingSet: WorkingSetMetrics, ignoredRecords: number }}
  */
 function calculateWorkingSetFromJSONL(content) {
-  const entries = [];
+  const { iterateJsonl } = require("./jsonl_helpers.cjs");
   let ignoredRecords = 0;
-
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
-    if (!line) continue;
-
-    try {
-      entries.push(JSON.parse(line));
-    } catch {
-      ignoredRecords += 1;
-    }
-  }
-
-  return calculateWorkingSetFromEntries(entries, ignoredRecords);
+  const entries = iterateJsonl(content, { onError: () => ignoredRecords++ });
+  const result = calculateWorkingSetFromEntries(entries);
+  result.ignoredRecords += ignoredRecords;
+  if (result.workingSet.measurement_state === "measured" && ignoredRecords > 0) result.workingSet.measurement_state = "partial";
+  return result;
 }
 
 module.exports = {

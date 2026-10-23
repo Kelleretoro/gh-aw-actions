@@ -2,6 +2,7 @@
 /// <reference types="@actions/github-script" />
 
 const { readExperimentAssignments } = require("./experiment_helpers.cjs");
+const { normalizeWebhookContext } = require("./webhook_context.cjs");
 
 /**
  * Resolves the item type, item number, and comment id from the GitHub Actions
@@ -116,6 +117,30 @@ function buildWorkflowCallId(runId, runAttempt, workflowRef) {
 }
 
 /**
+ * @param {Record<string, unknown> | null | undefined} awContext
+ * @returns {string}
+ */
+function readHopId(awContext) {
+  const hopId = typeof awContext?.hop_id === "string" ? awContext.hop_id.trim() : "";
+  return hopId || (typeof awContext?.workflow_call_id === "string" ? awContext.workflow_call_id.trim() : "");
+}
+
+/**
+ * Inbound context describes the caller. Context already describing this hop
+ * retains its recorded parent instead of creating a self-parent relationship.
+ *
+ * @param {Record<string, unknown> | null | undefined} awContext
+ * @param {string} currentHopId
+ * @returns {string}
+ */
+function resolveParentHopId(awContext, currentHopId) {
+  const inheritedHopId = readHopId(awContext);
+  const recordedParent = typeof awContext?.parent_hop_id === "string" ? awContext.parent_hop_id.trim() : "";
+  const parentHopId = inheritedHopId && inheritedHopId !== currentHopId ? inheritedHopId : recordedParent;
+  return parentHopId !== currentHopId ? parentHopId : "";
+}
+
+/**
  * @param {unknown} value
  * @returns {value is Record<string, unknown>}
  */
@@ -167,10 +192,87 @@ function readInboundAwContext(payload) {
   return parseInboundAwContext(payload?.inputs?.aw_context) || parseInboundAwContext(payload?.client_payload?.aw_context);
 }
 
+function parseWorkQueueAssignment(raw) {
+  const { parseStrictJSON } = require("./work_queue_codec.cjs");
+  const { normalizeAssignment } = require("./work_queue_claim_scope.cjs");
+  return normalizeAssignment(typeof raw === "string" ? parseStrictJSON(raw) : raw);
+}
+
+function readInboundWorkQueueAssignment(payload) {
+  const { parseStrictJSON } = require("./work_queue_codec.cjs");
+  const assignments = [];
+  for (const source of [payload?.inputs, payload?.client_payload]) {
+    if (!source) continue;
+    if (!isRecord(source)) throw new TypeError("work queue input context must be an object");
+    if (["work_queue_claim", "work_claim", "work_queue"].some(key => Object.hasOwn(source, key))) throw new TypeError("legacy scalar work queue assignments are unsupported");
+    if (Object.hasOwn(source, "work_queue_assignment")) assignments.push(parseWorkQueueAssignment(source.work_queue_assignment));
+    if (source.aw_context !== undefined && source.aw_context !== null && source.aw_context !== "") {
+      const embeddedContext = typeof source.aw_context === "string" ? parseStrictJSON(source.aw_context) : source.aw_context;
+      if (!isRecord(embeddedContext)) throw new TypeError("work queue input context must be an object");
+      const embedded = readWorkQueueAssignment(embeddedContext);
+      if (embedded) assignments.push(embedded);
+    }
+  }
+  if (assignments.length > 1) throw new TypeError("work_queue_assignment must have exactly one source");
+  return assignments[0] || null;
+}
+
+function resolveWorkQueueRuntime(payload, { role = process.env.GH_AW_WORK_QUEUE_ROLE, requireAssignment = false } = {}) {
+  const assignment = readInboundWorkQueueAssignment(payload);
+  if (role !== undefined && !["observer", "dispatcher", "worker"].includes(role)) throw new TypeError("work_queue_runtime_role_invalid");
+  if (requireAssignment && role !== undefined && role !== "worker") throw new Error("work_queue_runtime_role_conflict");
+  if (role === "observer" && assignment) throw new Error("work_queue_observer_assignment_forbidden");
+  if (role === "dispatcher" && assignment) throw new Error("work_queue_runtime_role_conflict");
+  const resolvedRole = role ?? (assignment || requireAssignment ? "worker" : "dispatcher");
+  if (resolvedRole === "worker" && !assignment) throw new Error("work_queue_assignment_required");
+  return { role: resolvedRole, assignment };
+}
+
+function readWorkQueueAssignment(awContext) {
+  if (!awContext) return null;
+  if (["work_queue", "work_claim", "work_queue_claim"].some(key => Object.hasOwn(awContext, key))) throw new TypeError("legacy scalar work queue assignments are unsupported");
+  return Object.hasOwn(awContext, "work_queue_assignment") ? parseWorkQueueAssignment(awContext.work_queue_assignment) : null;
+}
+
+function normalizeWorkQueueContext(awContext, rawWorkQueueAssignment) {
+  let assignment = readWorkQueueAssignment(awContext);
+  if (rawWorkQueueAssignment !== undefined) {
+    if (assignment) throw new TypeError("work_queue_assignment must have exactly one source");
+    assignment = parseWorkQueueAssignment(rawWorkQueueAssignment);
+  }
+  return assignment ? { ...awContext, work_queue_assignment: assignment } : { ...awContext };
+}
+
+// Preserve pre-queue metadata normalization only for workflows without the
+// compiler-managed queue. This data never supplies current Claim authority.
+function normalizeLegacyWorkQueueContext(awContext, rawClaim) {
+  const readAssignment = value => {
+    const hasCurrent = Object.hasOwn(value, "work_queue");
+    const hasLegacy = Object.hasOwn(value, "work_claim");
+    if (hasCurrent && hasLegacy) throw new TypeError("aw_context cannot contain both work_queue and the legacy work_claim assignment");
+    if (!hasCurrent && !hasLegacy) return null;
+    const assignment = hasCurrent ? value.work_queue : value.work_claim;
+    if (!isRecord(assignment) || Object.keys(assignment).length !== 3 || typeof assignment.work_id !== "string" || !assignment.work_id || typeof assignment.claim_id !== "string" || !assignment.claim_id || !isRecord(assignment.work))
+      throw new TypeError("work queue assignment has an invalid shape");
+    return { work_id: assignment.work_id, claim_id: assignment.claim_id, work: assignment.work };
+  };
+  let assignment = readAssignment(awContext);
+  if (rawClaim != null && rawClaim !== "") {
+    const claim = parseInboundAwContext(rawClaim);
+    if (!claim) throw new TypeError("work_queue_claim must be a JSON object");
+    if (assignment) throw new TypeError("work_queue_claim cannot be combined with an assignment in aw_context");
+    assignment = readAssignment({ work_queue: claim });
+  }
+  const normalized = { ...awContext };
+  delete normalized.work_claim;
+  if (assignment) normalized.work_queue = assignment;
+  return normalized;
+}
+
 /**
  * Builds the aw_context object that identifies the calling workflow run.
- * This metadata is injected into dispatched workflows that declare an
- * aw_context input, allowing them to trace back to their caller and
+ * This metadata is injected into compiler-managed dispatched workflows,
+ * allowing them to trace back to their caller and
  * resolve the current item (issue, pull request, discussion, check, etc.)
  * that triggered the calling workflow.
  *
@@ -200,7 +302,9 @@ function readInboundAwContext(payload) {
  *   otel_parent_span_id: string,
  *   trigger_label: string,
  *   experiments: string,
- *   allow_bot_authored_trigger_comment: boolean
+ *   allow_bot_authored_trigger_comment: boolean,
+ *   webhook?: {event: string, deliveries: {delivery_id: string, payload: any}[]},
+ *   items?: {item_type: string, item_number: string, repo: string, project_id?: string, url?: string, source?: string}[]
  * }}
  * Properties:
  *   - item_type: Kind of entity that triggered the workflow (issue, pull_request,
@@ -253,8 +357,8 @@ function buildAwContext() {
   const currentRunAttempt = String(process.env.GITHUB_RUN_ATTEMPT ?? "1");
   const currentHopId = buildWorkflowCallId(currentRunId, currentRunAttempt, workflowRef);
   const inheritedContext = readInboundAwContext(context.payload);
-  const inheritedHopId = typeof inheritedContext?.hop_id === "string" ? inheritedContext.hop_id.trim() : typeof inheritedContext?.workflow_call_id === "string" ? inheritedContext.workflow_call_id.trim() : "";
-  const parentHopId = typeof inheritedContext?.parent_hop_id === "string" && inheritedContext.parent_hop_id.trim() ? inheritedContext.parent_hop_id.trim() : inheritedHopId;
+  const inheritedHopId = readHopId(inheritedContext);
+  const parentHopId = resolveParentHopId(inheritedContext, currentHopId);
   const episodeId = typeof inheritedContext?.episode_id === "string" && inheritedContext.episode_id.trim() ? inheritedContext.episode_id.trim() : inheritedHopId || currentHopId;
   const originEvent =
     typeof inheritedContext?.origin_event === "string" && inheritedContext.origin_event.trim()
@@ -293,6 +397,7 @@ function buildAwContext() {
   const allowBotAuthoredTriggerComment = isIssueCommentEdited && triggerCommentByBot && triggerCommentAuthor !== (context.actor ?? "");
 
   return {
+    ...normalizeWebhookContext(inheritedContext),
     repo: currentRepo,
     run_id: String(context.runId ?? ""),
     run_attempt: currentRunAttempt,
@@ -357,4 +462,16 @@ function buildAwContext() {
   };
 }
 
-module.exports = { buildAwContext, buildWorkflowCallId, resolveItemContext };
+module.exports = {
+  buildAwContext,
+  buildWorkflowCallId,
+  resolveParentHopId,
+  resolveItemContext,
+  parseInboundAwContext,
+  readInboundAwContext,
+  readInboundWorkQueueAssignment,
+  readWorkQueueAssignment,
+  normalizeWorkQueueContext,
+  normalizeLegacyWorkQueueContext,
+  resolveWorkQueueRuntime,
+};

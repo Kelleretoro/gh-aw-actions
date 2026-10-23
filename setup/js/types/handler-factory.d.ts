@@ -14,6 +14,8 @@ interface HandlerConfig {
   excluded_files?: string[];
   /** List of filenames (basenames) whose presence in a patch triggers protected-file handling */
   protected_files?: string[];
+  /** Exact repository paths exempt from protected-file handling (not from allowed_files) */
+  protected_files_path_exclude?: string[];
   /** List of path prefixes that trigger protected-file handling when any changed file matches */
   protected_path_prefixes?: string[];
   /** When true (default), protect any top-level directory whose name starts with "." */
@@ -26,6 +28,8 @@ interface HandlerConfig {
   fallback_as_pull_request?: boolean;
   /** When false, skip GraphQL signed commits and push the local git history directly. */
   signed_commits?: boolean;
+  /** Explicit opt-in to potentially unbounded bundle prerequisite downloads. Defaults to false. */
+  allow_full_history_fetch?: boolean;
   /** Additional handler-specific configuration properties */
   [key: string]: any;
 }

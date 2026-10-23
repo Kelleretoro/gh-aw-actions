@@ -1,14 +1,17 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonl } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { displayDirectories } = require("./display_file_helpers.cjs");
 const { ERR_PARSE, ERR_SYSTEM } = require("./error_codes.cjs");
 const { formatModelEmojiAlias } = require("./model_aliases.cjs");
-const { computeInferenceAIC, formatAIC } = require("./model_costs.cjs");
-const { generateUnifiedTimelineSummary } = require("./unified_timeline.cjs");
+const { computeInferenceAIC, findModelPricing, formatAIC } = require("./model_costs.cjs");
 const { parseUnknownModelAICreditsFromAuditLog } = require("./ai_credits_context.cjs");
+const { getMcpRateLimitHint, getRpcRateLimitHint } = require("./mcp_rate_limit.cjs");
+const { MAX_STEP_SUMMARY_SIZE } = require("./log_parser_shared.cjs");
+const { boundSummaryLines } = require("./agent_session_render.cjs");
 
 /**
  * Parses MCP gateway logs and creates a step summary
@@ -113,7 +116,7 @@ function formatAICForTable(value, source) {
  * aborts, retries, authentication, and safe outputs use separate paths.
  *
  * @param {string} jsonlContent - The token-usage.jsonl file content
- * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, totalAIC: number, aiCreditsSource: "awf_reported"|"recomputed", aiCreditsWarnings: string[], ambientContextTokens: number|undefined, byModel: Record<string, any>, entries: Array} | null}
+ * @returns {{totalInputTokens: number, totalOutputTokens: number, totalCacheReadTokens: number, totalCacheWriteTokens: number, totalRequests: number, totalDurationMs: number, totalAIC: number, aiCreditsAvailable: boolean, aiCreditsSource: "awf_reported"|"recomputed", aiCreditsWarnings: string[], ambientContextTokens: number|undefined, byModel: Record<string, any>, entries: Array} | null}
  * ambientContextTokens records first-request context size as:
  * input_tokens + ((cache_read_tokens + cache_write_tokens) / 10).
  */
@@ -128,6 +131,7 @@ function parseTokenUsageJsonl(jsonlContent) {
     totalRequests: 0,
     totalDurationMs: 0,
     totalAIC: 0,
+    aiCreditsAvailable: true,
     /** @type {"awf_reported"|"recomputed"} */
     aiCreditsSource: "recomputed",
     /** @type {string[]} */
@@ -140,12 +144,8 @@ function parseTokenUsageJsonl(jsonlContent) {
     entries: [],
   };
 
-  const lines = jsonlContent.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
+  for (const entry of iterateJsonl(jsonlContent)) {
     try {
-      const entry = JSON.parse(trimmed);
       if (!entry || typeof entry !== "object") continue;
       const requestId = typeof entry.request_id === "string" ? entry.request_id.trim() : "";
       const eventName = typeof entry.event === "string" && entry.event ? entry.event : "token_usage";
@@ -243,6 +243,7 @@ function parseTokenUsageJsonl(jsonlContent) {
     // AWF added reported AIC and explicit cache-semantics fields.
     let totalAIC = 0;
     for (const [model, usage] of Object.entries(summary.byModel)) {
+      if (!findModelPricing(usage.provider || "", model)) summary.aiCreditsAvailable = false;
       const aic = computeInferenceAIC({
         provider: usage.provider || "",
         model,
@@ -295,6 +296,7 @@ function parseTokenUsageJsonl(jsonlContent) {
       if (entry.reportedDeltaAIC !== null) {
         entry.deltaAIC = entry.reportedDeltaAIC;
       } else {
+        if (!findModelPricing(entry.provider || "", entry.model)) summary.aiCreditsAvailable = false;
         if (entry.hasInputTokensIncludeCacheField && typeof entry.inputTokensIncludeCache !== "boolean") {
           invalidCacheSemanticsCount++;
         }
@@ -311,6 +313,8 @@ function parseTokenUsageJsonl(jsonlContent) {
       }
       summary.byModel[entry.model].aic += entry.deltaAIC;
       runningAIC = entry.reportedTotalAIC ?? runningAIC + entry.deltaAIC;
+      // A reported cumulative total covers earlier requests with unknown pricing.
+      if (entry.reportedTotalAIC !== null) summary.aiCreditsAvailable = true;
       entry.runningAIC = runningAIC;
     }
 
@@ -380,13 +384,54 @@ function generateTokenUsageSummary(summary) {
 }
 
 /**
- * Writes the step summary and exports AI credit metadata when token usage data exists.
- * Token Usage rendering is handled by parse_token_usage.cjs to avoid duplicate sections.
- * This is the final call in each main() exit path — it consolidates the summary write
- * so callers don't need to chain addRaw() + write() themselves.
- * @param {typeof import('@actions/core')} coreObj - The GitHub Actions core object
+ * Bound oversized sections without leaving partial Markdown/HTML structures open.
+ * The complete redacted logs remain in the existing agent artifact.
+ * @param {string} content
+ * @param {number} maxBytes
+ * @returns {string}
  */
-async function writeStepSummaryWithTokenUsage(coreObj) {
+function boundGatewaySummary(content, maxBytes) {
+  if (Buffer.byteLength(content, "utf8") <= maxBytes) return content;
+  const notice = `MCP gateway summary truncated (${Buffer.byteLength(content, "utf8")} bytes). Full redacted logs: \`mcp-logs/\` in the agent artifact.\n\n`;
+  const header = `${notice}<details>\n<summary>MCP gateway diagnostic preview</summary>\n<pre>\n`;
+  const footer = "\n</pre>\n</details>\n";
+  const budget = maxBytes - Buffer.byteLength(header + footer, "utf8");
+  if (budget < 128) return Buffer.byteLength(notice, "utf8") <= maxBytes ? notice : "";
+  const lines = content.split("\n").map(line => escapeHtml(line));
+  return header + boundSummaryLines(lines, budget, 4096).join("\n") + footer;
+}
+
+/**
+ * @param {typeof import('@actions/core')} coreObj
+ * @param {string[]} sections
+ */
+function appendGatewaySummary(coreObj, sections) {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  let remaining = MAX_STEP_SUMMARY_SIZE;
+  try {
+    if (summaryPath && fs.existsSync(summaryPath)) remaining -= fs.statSync(summaryPath).size;
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Failed to measure existing MCP gateway step summary: ${getErrorMessage(error)}`, { cause: error });
+  }
+  for (const [index, section] of sections.entries()) {
+    // Share the remaining capacity so a verbose gateway log cannot crowd out
+    // later rate-limit, steering, or DIFC diagnostics.
+    const budget = Math.max(0, Math.floor(remaining / (sections.length - index)));
+    const bounded = boundGatewaySummary(section, budget);
+    if (bounded !== section) coreObj.warning("MCP gateway step summary byte limit reached; full redacted logs are in the agent artifact.");
+    if (bounded) coreObj.summary.addRaw(bounded);
+    remaining -= Buffer.byteLength(bounded, "utf8");
+  }
+}
+
+/**
+ * Writes bounded gateway diagnostics and exports AI credit metadata.
+ * Token Usage rendering is handled by parse_token_usage.cjs to avoid duplicate sections.
+ * @param {typeof import('@actions/core')} coreObj - The GitHub Actions core object
+ * @param {string[]} [sections] - Gateway sections sharing this step's byte budget
+ */
+async function writeStepSummaryWithTokenUsage(coreObj, sections = []) {
+  appendGatewaySummary(coreObj, sections);
   if (!fs.existsSync(TOKEN_USAGE_PATH)) {
     coreObj.debug(`No token-usage.jsonl found at: ${TOKEN_USAGE_PATH}`);
   } else {
@@ -402,7 +447,7 @@ async function writeStepSummaryWithTokenUsage(coreObj) {
       for (const warning of parsedSummary?.aiCreditsWarnings || []) {
         coreObj.warning?.(`[ai-credits] ${warning}`);
       }
-      if (parsedSummary && (parsedSummary.aiCreditsSource === "awf_reported" || parsedSummary.totalAIC > 0)) {
+      if (parsedSummary?.aiCreditsAvailable && (parsedSummary.aiCreditsSource === "awf_reported" || parsedSummary.totalAIC > 0)) {
         const aic = formatAICForOutput(parsedSummary.totalAIC, parsedSummary.aiCreditsSource);
         coreObj.exportVariable("GH_AW_AIC", aic);
         coreObj.setOutput("aic", aic);
@@ -415,15 +460,6 @@ async function writeStepSummaryWithTokenUsage(coreObj) {
         coreObj.info(`Ambient context: ${roundedAmbientContext}`);
       }
     }
-  }
-
-  // Append the unified event timeline (gateway + firewall audit + agent events)
-  // to the step summary immediately before flushing, so it appears as the last
-  // section regardless of which gateway log format was detected above.
-  const timelineMd = generateUnifiedTimelineSummary();
-  if (timelineMd) {
-    coreObj.info(`Appending unified event timeline to step summary`);
-    coreObj.summary.addRaw(timelineMd);
   }
 
   await coreObj.summary.write();
@@ -484,12 +520,8 @@ function printAllGatewayFiles() {
  */
 function parseGatewayJsonlForDifcFiltered(jsonlContent) {
   const filteredEvents = [];
-  const lines = jsonlContent.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || !/difc_filtered/i.test(trimmed)) continue;
+  for (const entry of iterateJsonl(jsonlContent, { lineFilter: line => /difc_filtered/i.test(line) })) {
     try {
-      const entry = JSON.parse(trimmed);
       if (getRpcMessageType(entry) === "DIFC_FILTERED") {
         filteredEvents.push(entry);
       }
@@ -508,12 +540,8 @@ function parseGatewayJsonlForDifcFiltered(jsonlContent) {
  */
 function parseGatewayJsonlForTokenSteering(jsonlContent) {
   const steeringEvents = [];
-  const lines = jsonlContent.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || !trimmed.includes("token_steering")) continue;
+  for (const entry of iterateJsonl(jsonlContent, { lineFilter: line => line.includes("token_steering") })) {
     try {
-      const entry = JSON.parse(trimmed);
       const eventName = getGatewayEventName(entry);
       if (eventName === "token_steering") {
         steeringEvents.push(entry);
@@ -544,13 +572,8 @@ const MODEL_ALIAS_EVENT_NAMES = new Set(["model_alias_resolution", "model_rewrit
  */
 function parseGatewayJsonlForModelAliasResolution(jsonlContent) {
   const aliasResolutionEvents = [];
-  const lines = jsonlContent.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (!trimmed.includes("model_alias") && !trimmed.includes("model_rewrite") && !trimmed.includes("MODEL_ALIAS")) continue;
+  for (const entry of iterateJsonl(jsonlContent, { lineFilter: line => line.includes("model_alias") || line.includes("model_rewrite") || line.includes("MODEL_ALIAS") })) {
     try {
-      const entry = JSON.parse(trimmed);
       const eventName = getGatewayEventName(entry);
       if (MODEL_ALIAS_EVENT_NAMES.has(eventName)) {
         aliasResolutionEvents.push(entry);
@@ -677,12 +700,8 @@ function parseRpcMessagesJsonl(jsonlContent) {
   const responses = [];
   const other = [];
 
-  const lines = jsonlContent.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
+  for (const entry of iterateJsonl(jsonlContent)) {
     try {
-      const entry = JSON.parse(trimmed);
       if (!entry || typeof entry !== "object") continue;
       const messageType = getRpcMessageType(entry);
       if (!messageType) continue;
@@ -798,11 +817,51 @@ function formatRpcInlineCodeLabel(value) {
 }
 
 /**
+ * Surface failed MCP calls separately from successful content that quotes 429s.
+ * @param {string} jsonlContent
+ * @returns {string}
+ */
+function generateMcpRateLimitSummary(jsonlContent) {
+  const { requests, responses, other } = parseRpcMessagesJsonl(jsonlContent);
+  /** @param {Object} entry */
+  const requestKey = entry => JSON.stringify([entry.server_id, entry.payload?.id]);
+  const tools = new Map(requests.filter(entry => entry.payload?.method === "tools/call" && entry.payload?.id != null).map(entry => [requestKey(entry), getRpcRequestLabel(entry)]));
+  const rows = [];
+  for (const response of responses) {
+    const hint = getRpcRateLimitHint(response);
+    if (hint !== null) {
+      rows.push(buildRpcSummaryRow([formatRpcInlineCodeLabel(response.server_id), formatRpcInlineCodeLabel(tools.get(requestKey(response)) || "unknown"), hint]));
+    }
+  }
+  for (const entry of other) {
+    if (entry.type !== "tool_call" || typeof entry.error !== "string") continue;
+    const hint = getMcpRateLimitHint(entry.error);
+    if (hint !== null) rows.push(buildRpcSummaryRow([formatRpcInlineCodeLabel(entry.server_name), formatRpcInlineCodeLabel(entry.tool_name), hint]));
+  }
+  if (rows.length === 0) return "";
+  return [
+    "<details>",
+    "<summary>MCP rate limits (HTTP 429)</summary>",
+    "",
+    "| Server | Tool | Retry hint |",
+    "|--------|------|------------|",
+    ...new Set(rows),
+    "",
+    "Retry hints are reported by the server, not a guarantee that the next request will succeed.",
+    "",
+    "</details>",
+    "",
+  ].join("\n");
+}
+
+/**
  * Summarizes an MCP RESPONSE entry for table rendering.
  * @param {Object} entry
  * @returns {{status: string, details: string}}
  */
 function summarizeRpcResponseEntry(entry) {
+  const rateLimitHint = getRpcRateLimitHint(entry);
+  if (rateLimitHint !== null) return { status: "error", details: `HTTP 429: ${rateLimitHint}` };
   const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
   const error = payload.error && typeof payload.error === "object" ? payload.error : null;
   if (error) {
@@ -816,6 +875,7 @@ function summarizeRpcResponseEntry(entry) {
 
   const result = payload.result;
   if (result && typeof result === "object") {
+    if (result.isError === true) return { status: "error", details: "Tool returned an error" };
     if (Array.isArray(result.tools)) {
       return {
         status: "ok",
@@ -1011,6 +1071,7 @@ function generateRpcMessagesSummary(entries, difcFilteredEvents) {
  */
 async function main() {
   try {
+    const summarySections = [];
     // First, print all gateway-related files for debugging
     printAllGatewayFiles();
 
@@ -1029,8 +1090,10 @@ async function main() {
     let modelAliasResolutionEvents = [];
     /** @type {any} */
     let rpcMessagesContent = null;
+    let gatewayJsonlContent = "";
     if (fs.existsSync(gatewayJsonlPath)) {
       const jsonlContent = fs.readFileSync(gatewayJsonlPath, "utf8");
+      gatewayJsonlContent = jsonlContent;
       core.info(`Found gateway.jsonl (${jsonlContent.length} bytes)`);
       difcFilteredEvents = parseGatewayJsonlForDifcFiltered(jsonlContent);
       tokenSteeringEvents = parseGatewayJsonlForTokenSteering(jsonlContent);
@@ -1072,6 +1135,16 @@ async function main() {
       core.info(`No gateway.jsonl or rpc-messages.jsonl found for steering or DIFC_FILTERED scanning`);
     }
 
+    // RPC responses remain useful even when gateway.md or gateway.jsonl is present.
+    if (rpcMessagesContent === null && fs.existsSync(rpcMessagesPath)) {
+      rpcMessagesContent = fs.readFileSync(rpcMessagesPath, "utf8");
+    }
+    const rateLimitSummary = generateMcpRateLimitSummary(`${gatewayJsonlContent}\n${rpcMessagesContent || ""}`);
+    if (rateLimitSummary) {
+      core.warning("MCP tools returned HTTP 429; see the MCP rate limits summary for retry hints.");
+      summarySections.push(rateLimitSummary);
+    }
+
     // Always scan authoritative text logs for AI credits signals before selecting
     // which format to render in the step summary.
     let gatewayLogContent = "";
@@ -1108,27 +1181,27 @@ async function main() {
         unknownModelAICredits ||= hasUnknownModelAICreditsError([gatewayMdContent]);
 
         // Write the markdown directly to the step summary
-        core.summary.addRaw(gatewayMdContent.endsWith("\n") ? gatewayMdContent : gatewayMdContent + "\n");
+        summarySections.push(gatewayMdContent.endsWith("\n") ? gatewayMdContent : gatewayMdContent + "\n");
 
         // Append any proxy-side steering or DIFC_FILTERED sections after the gateway summary
         if (tokenSteeringEvents.length > 0) {
           const steeringSummary = generateTokenSteeringSummary(tokenSteeringEvents);
-          core.summary.addRaw(steeringSummary);
+          summarySections.push(steeringSummary);
         }
 
         if (modelAliasResolutionEvents.length > 0) {
           const modelAliasResolutionSummary = generateModelAliasResolutionSummary(modelAliasResolutionEvents);
-          core.summary.addRaw(modelAliasResolutionSummary);
+          summarySections.push(modelAliasResolutionSummary);
         }
 
         if (difcFilteredEvents.length > 0) {
           const difcSummary = generateDifcFilteredSummary(difcFilteredEvents);
-          core.summary.addRaw(difcSummary);
+          summarySections.push(difcSummary);
         }
 
         setAICreditsRateLimitOutput(core, aiCreditsRateLimitError);
         setUnknownModelAICreditsOutput(core, unknownModelAICredits);
-        await writeStepSummaryWithTokenUsage(core);
+        await writeStepSummaryWithTokenUsage(core, summarySections);
         return;
       }
     } else {
@@ -1146,20 +1219,20 @@ async function main() {
       if (totalMessages > 0 || difcFilteredEvents.length > 0) {
         const rpcSummary = generateRpcMessagesSummary(rpcEntries, difcFilteredEvents);
         if (rpcSummary.length > 0) {
-          core.summary.addRaw(rpcSummary);
+          summarySections.push(rpcSummary);
         }
         if (tokenSteeringEvents.length > 0) {
-          core.summary.addRaw(generateTokenSteeringSummary(tokenSteeringEvents));
+          summarySections.push(generateTokenSteeringSummary(tokenSteeringEvents));
         }
         if (modelAliasResolutionEvents.length > 0) {
-          core.summary.addRaw(generateModelAliasResolutionSummary(modelAliasResolutionEvents));
+          summarySections.push(generateModelAliasResolutionSummary(modelAliasResolutionEvents));
         }
       } else {
         core.info("rpc-messages.jsonl is present but contains no renderable messages");
       }
       setAICreditsRateLimitOutput(core, aiCreditsRateLimitError);
       setUnknownModelAICreditsOutput(core, unknownModelAICredits);
-      await writeStepSummaryWithTokenUsage(core);
+      await writeStepSummaryWithTokenUsage(core, summarySections);
       return;
     }
 
@@ -1175,7 +1248,7 @@ async function main() {
       core.info("MCP gateway log files are empty or missing");
       setAICreditsRateLimitOutput(core, aiCreditsRateLimitError);
       setUnknownModelAICreditsOutput(core, unknownModelAICredits);
-      await writeStepSummaryWithTokenUsage(core);
+      await writeStepSummaryWithTokenUsage(core, summarySections);
       return;
     }
 
@@ -1185,18 +1258,15 @@ async function main() {
       core.info(plainTextSummary);
     }
 
-    // Generate step summary: legacy logs + DIFC filtered section
+    // Keep supplemental diagnostics separate from potentially verbose legacy logs.
     const legacySummary = generateGatewayLogSummary(gatewayLogContent, stderrLogContent);
     const steeringSummary = generateTokenSteeringSummary(tokenSteeringEvents);
     const modelAliasResolutionSummary = generateModelAliasResolutionSummary(modelAliasResolutionEvents);
     const difcSummary = generateDifcFilteredSummary(difcFilteredEvents);
-    const fullSummary = [legacySummary, steeringSummary, modelAliasResolutionSummary, difcSummary].filter(s => s.length > 0).join("\n");
-
-    if (fullSummary.length > 0) {
-      core.summary.addRaw(fullSummary);
-    }
+    summarySections.push(...[legacySummary, steeringSummary, modelAliasResolutionSummary, difcSummary].filter(s => s.length > 0));
     setAICreditsRateLimitOutput(core, aiCreditsRateLimitError);
     setUnknownModelAICreditsOutput(core, unknownModelAICredits);
+    await writeStepSummaryWithTokenUsage(core, summarySections);
   } catch (error) {
     core.setFailed(`${ERR_PARSE}: ${getErrorMessage(error)}`);
   }
@@ -1320,13 +1390,17 @@ if (typeof module !== "undefined" && module.exports) {
     parseRpcMessagesJsonl,
     getRpcMessageType,
     getRpcRequestLabel,
+    getMcpRateLimitHint,
+    getRpcRateLimitHint,
     generateRpcMessagesSummary,
+    generateMcpRateLimitSummary,
     printAllGatewayFiles,
     parseTokenUsageJsonl,
     generateTokenUsageSummary,
     formatDurationMs,
     formatAICForOutput,
     writeStepSummaryWithTokenUsage,
+    boundGatewaySummary,
     hasAICreditsRateLimitError,
     hasUnknownModelAICreditsError,
     setUnknownModelAICreditsOutput,

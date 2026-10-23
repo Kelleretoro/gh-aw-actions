@@ -2,6 +2,7 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { validateTargetRepo, parseAllowedRepos, getDefaultTargetRepo } = require("./repo_helpers.cjs");
+const { normalizeSafeOutputName, normalizeSafeOutputConfig } = require("./safe_output_names.cjs");
 
 const fs = require("fs");
 
@@ -82,6 +83,9 @@ const NON_TOOL_CONFIG_KEYS = new Set(["create_report_incomplete_issue", "create_
  * @returns {boolean} True when a tool of the same family is already defined
  */
 function isConfigKeyCoveredByDynamicTool(tools, normalizedKey) {
+  if (normalizedKey === "ledger_append" && tools.some(tool => tool?._ledger_type && tool?._ledger_operation)) {
+    return true;
+  }
   const metadataKey = DYNAMIC_TOOL_METADATA_BY_CONFIG_KEY[normalizedKey];
   if (!metadataKey) {
     return false;
@@ -122,7 +126,7 @@ function loadTools(server) {
     const toolsFileContent = fs.readFileSync(toolsPath, "utf8");
     server.debug(`Tools file content length: ${toolsFileContent.length} characters`);
     server.debug(`Tools file read successfully, attempting to parse JSON`);
-    const tools = JSON.parse(toolsFileContent);
+    const tools = JSON.parse(toolsFileContent).map(tool => ({ ...tool, name: normalizeSafeOutputName(tool.name) }));
     server.debug(`Successfully parsed ${tools.length} tools from file`);
 
     // Log details about dispatch_workflow tools for debugging
@@ -206,11 +210,18 @@ function attachHandlers(tools, handlers, logger) {
   };
 
   tools.forEach(tool => {
+    tool.name = normalizeSafeOutputName(tool.name);
     const handler = handlerMap[normalizeConfiguredToolName(tool.name)];
     if (handler) {
       tool.handler = handler;
     } else if (typeof handlers.defaultHandler === "function") {
       tool.handler = handlers.defaultHandler(tool.name);
+    }
+    if (tool._ledger_type && tool._ledger_operation && typeof handlers.ledgerBuiltinHandler === "function") {
+      tool.handler = handlers.ledgerBuiltinHandler(tool._ledger_type, tool._ledger_operation);
+    }
+    if (normalizeConfiguredToolName(tool.name) === "ledger_append" && typeof handlers.ledgerAgentAppendHandler === "function") {
+      tool.handler = handlers.ledgerAgentAppendHandler;
     }
 
     // Check if this is a dispatch_workflow tool (dynamic tool with workflow metadata)
@@ -275,6 +286,7 @@ function attachHandlers(tools, handlers, logger) {
  * @param {Function} normalizeTool - Function to normalize tool names
  */
 function registerPredefinedTools(server, tools, config, registerTool, normalizeTool) {
+  config = normalizeSafeOutputConfig(config);
   const toolSafetyWarnings = {
     add_comment: " This tool records a real comment intent. Do not use it for placeholder comments, auth checks, or probing. Call it only when the final comment body is ready; otherwise use noop or report_incomplete.",
     create_issue: " This tool records a real issue intent. Do not use it for placeholder titles/bodies, auth checks, or probing. Call it only when the final issue title/body are ready; otherwise use noop or report_incomplete.",
@@ -286,6 +298,12 @@ function registerPredefinedTools(server, tools, config, registerTool, normalizeT
   tools.forEach(tool => {
     // Check if this is a regular tool matching a config key
     const normalizedToolName = normalizeTool(tool.name);
+    if (tool._ledger_type && tool._ledger_operation) {
+      if (Array.isArray(config.ledger_append?.ledgers) && config.ledger_append.ledgers.some(ledger => ledger.type === tool._ledger_type)) {
+        registerTool(server, tool);
+      }
+      return;
+    }
     if (Object.keys(config).find(configKey => normalizeTool(configKey) === normalizedToolName)) {
       let toolToRegister = tool;
       const safetyWarning = toolSafetyWarnings[normalizedToolName];
@@ -389,7 +407,7 @@ function registerPredefinedTools(server, tools, config, registerTool, normalizeT
  */
 function registerDynamicTools(server, tools, config, outputFile, registerTool, normalizeTool) {
   Object.keys(config).forEach(configKey => {
-    const normalizedKey = normalizeTool(configKey);
+    const normalizedKey = normalizeSafeOutputName(normalizeTool(configKey));
 
     // Skip config keys that are never exposed as agent-facing tools (handler-only output
     // types and global configuration knobs).

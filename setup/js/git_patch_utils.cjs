@@ -16,6 +16,7 @@ const fs = require("fs");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { execGitSync } = require("./git_helpers.cjs");
+const { scopedArtifactFilename } = require("./work_queue_claim_scope.cjs");
 
 /**
  * Debug logging helper - logs to stderr when DEBUG env var matches
@@ -50,7 +51,11 @@ function sanitizeForFilename(value, fallback) {
  * @returns {string} The sanitized branch name safe for use in a filename
  */
 function sanitizeBranchNameForPatch(branchName) {
-  return sanitizeForFilename(branchName, "unknown");
+  const sanitized = sanitizeForFilename(branchName, "unknown");
+  if (!sanitized || (branchName && /^-+$/.test(branchName.trim()))) {
+    throw new Error("Invalid branch name: provide a name containing more than dashes or filename separators.");
+  }
+  return sanitized;
 }
 
 /**
@@ -69,7 +74,7 @@ function sanitizeRepoSlugForPatch(repoSlug) {
  */
 function getPatchPathForBranch(branchName) {
   const sanitized = sanitizeBranchNameForPatch(branchName);
-  return `/tmp/gh-aw/aw-${sanitized}.patch`;
+  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitized}.patch`);
 }
 
 /**
@@ -82,7 +87,7 @@ function getPatchPathForBranch(branchName) {
 function getPatchPathForBranchInRepo(branchName, repoSlug) {
   const sanitizedBranch = sanitizeBranchNameForPatch(branchName);
   const sanitizedRepo = sanitizeRepoSlugForPatch(repoSlug);
-  return `/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.patch`;
+  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.patch`);
 }
 
 /**
@@ -165,10 +170,18 @@ function getPatchDiffSizeBytes(patchContent) {
  * @param {Object} options
  * @param {(args: string[], opts?: Record<string, any>) => string} options.execGitSyncFn
  * @param {string} [options.cwd]
+ * @param {string[]} [options.pathspecs] - Optional pathspecs to limit the staged diff
  * @returns {number}
  */
-function getStagedPatchDiffSizeBytes({ execGitSyncFn, cwd }) {
-  const patchContent = execGitSyncFn(["diff", "--cached"], { stdio: "pipe", cwd });
+function getStagedPatchDiffSizeBytes({ execGitSyncFn, cwd, pathspecs }) {
+  if (Array.isArray(pathspecs) && pathspecs.length === 0) {
+    return 0;
+  }
+  const args = ["diff", "--cached", "--no-renames"];
+  if (Array.isArray(pathspecs)) {
+    args.push("--", ...pathspecs);
+  }
+  const patchContent = execGitSyncFn(args, { stdio: "pipe", cwd });
   return getPatchDiffSizeBytes(patchContent);
 }
 

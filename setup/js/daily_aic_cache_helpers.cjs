@@ -1,5 +1,6 @@
 // @ts-check
 
+const { iterateJsonl, iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 /**
  * daily_aic_cache_helpers.cjs
  *
@@ -23,16 +24,10 @@ const AIC_SCAN_CACHE_ARTIFACT_NAME = "aic-usage-scan-v2";
  */
 function readScanCache(content, repository, workflowId, now = Date.now()) {
   const entries = new Map();
-  for (const line of content.split("\n").filter(line => line.trim())) {
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  for (const entry of iterateJsonl(content)) {
     if (
       entry?.version !== 2 ||
-      entry.coverage_version !== 1 ||
+      entry.coverage_version !== 3 ||
       entry.repository !== repository ||
       entry.workflow_id !== workflowId ||
       !Number.isSafeInteger(entry.run_id) ||
@@ -41,6 +36,7 @@ function readScanCache(content, repository, workflowId, now = Date.now()) {
       entry.run_attempt <= 0 ||
       !Number.isFinite(entry.aic) ||
       entry.aic < 0 ||
+      (entry.source !== undefined && entry.source !== "recorded" && entry.source !== "estimated") ||
       !Number.isFinite(Date.parse(entry.created_at)) ||
       !Number.isFinite(Date.parse(entry.updated_at)) ||
       !Number.isFinite(Date.parse(entry.observed_at)) ||
@@ -50,10 +46,11 @@ function readScanCache(content, repository, workflowId, now = Date.now()) {
       continue;
     }
     const prior = entries.get(entry.run_id);
-    if (prior && prior.run_attempt === entry.run_attempt && prior.updated_at === entry.updated_at && prior.aic !== entry.aic) {
+    const sameAttempt = prior && prior.run_attempt === entry.run_attempt && prior.created_at === entry.created_at && prior.updated_at === entry.updated_at;
+    if (prior && prior.run_attempt === entry.run_attempt && prior.updated_at === entry.updated_at && prior.aic !== entry.aic && prior.source === "recorded" && entry.source === "recorded") {
       throw new Error("Conflicting daily AIC observations for a completed run attempt");
     }
-    if (!prior || Date.parse(entry.observed_at) >= Date.parse(prior.observed_at)) {
+    if (!prior || (Date.parse(entry.observed_at) >= Date.parse(prior.observed_at) && (!sameAttempt || prior.source !== "recorded" || entry.source === "recorded"))) {
       entries.set(entry.run_id, entry);
     }
   }
@@ -64,13 +61,13 @@ function matchesCompletedRun(entry, run) {
   return entry?.run_attempt === run.run_attempt && entry.created_at === run.created_at && entry.updated_at === run.updated_at;
 }
 
-function scanCacheEntry(run, aic, repository, workflowId, now = Date.now()) {
+function scanCacheEntry(run, aic, repository, workflowId, now = Date.now(), source = "recorded") {
   if (!Number.isFinite(aic) || aic < 0) {
     throw new Error("Daily AIC observation is not a finite non-negative value");
   }
   return {
     version: 2,
-    coverage_version: 1,
+    coverage_version: 3,
     repository,
     workflow_id: workflowId,
     run_id: run.id,
@@ -78,6 +75,7 @@ function scanCacheEntry(run, aic, repository, workflowId, now = Date.now()) {
     created_at: run.created_at,
     updated_at: run.updated_at,
     aic,
+    source,
     observed_at: new Date(now).toISOString(),
   };
 }
@@ -102,16 +100,16 @@ function pruneStaleJSONLCacheLines(content, cutoffMs) {
   const keptLines = [];
   let prunedCount = 0;
   let totalCount = 0;
-  for (const rawLine of content.split("\n")) {
-    const line = rawLine.trim();
+  for (const event of iterateJsonlEvents(content)) {
+    const line = event.rawLine.trim();
     if (!line) continue;
     totalCount++;
     if (!line.startsWith("{")) {
       prunedCount++;
       continue;
     }
-    try {
-      const entry = JSON.parse(line);
+    if (event.type === "json") {
+      const entry = event.value;
       if (typeof entry?.timestamp === "string") {
         const ts = Date.parse(entry.timestamp);
         if (Number.isFinite(ts) && ts < cutoffMs) {
@@ -119,11 +117,8 @@ function pruneStaleJSONLCacheLines(content, cutoffMs) {
           continue;
         }
       }
-      keptLines.push(line);
-    } catch {
-      // Preserve object-like lines that cannot be parsed (defensive: avoids data loss).
-      keptLines.push(line);
     }
+    keptLines.push(line);
   }
   return { keptLines, prunedCount, totalCount };
 }

@@ -1,4 +1,5 @@
 // @ts-check
+const { normalizeSafeOutputName } = require("./safe_output_names.cjs");
 
 const fs = require("fs");
 const nodePath = require("path");
@@ -6,6 +7,28 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
 const { MANIFEST_FILE_PATH, TEMPORARY_ID_MAP_FILE_PATH, SAFE_OUTPUT_ERRORS_FILE_PATH } = require("./constants.cjs");
 const { redactBuiltInPatterns, redactSecrets, extractMCPGatewayTokens, MCP_GATEWAY_CONFIG_PATHS } = require("./redact_secrets.cjs");
+const { currentClaimHandle, claimArtifactPath, claimIdentity, assertClaimIdentity, assertClaimArtifactDirectory, assertClaimArtifactFile } = require("./work_queue_claim_scope.cjs");
+
+const CLAIM_DELIVERY_ERRORS_FILE_NAME = "claim-delivery-errors.json";
+
+/** @param {string} filename @returns {string} */
+function scopedArtifactFile(filename) {
+  const handle = currentClaimHandle();
+  if (!handle) return filename;
+  const scoped = nodePath.basename(nodePath.dirname(filename)) === nodePath.basename(claimArtifactPath("", handle)) && nodePath.basename(nodePath.dirname(nodePath.dirname(filename))) === "claims";
+  const directory = scoped ? nodePath.dirname(filename) : claimArtifactPath(nodePath.dirname(filename), handle);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  assertClaimArtifactDirectory(directory);
+  fs.chmodSync(directory, 0o700);
+  const destination = nodePath.join(directory, nodePath.basename(filename));
+  const existing = fs.lstatSync(destination, { throwIfNoEntry: false });
+  if (existing) {
+    assertClaimArtifactFile(destination, directory);
+    if (!existing.isFile() || existing.nlink !== 1) throw new Error(`${ERR_SYSTEM}: Claim diagnostic must be a private regular file`);
+    fs.chmodSync(destination, 0o600);
+  }
+  return destination;
+}
 
 /**
  * Collect custom secret values for artifact redaction.
@@ -64,15 +87,15 @@ const CREATE_ITEM_TYPES = new Set([
  * Safe output types that should NEVER be logged to the manifest.
  * These types represent metadata signals rather than GitHub state changes:
  * - noop: no-op message, produces no GitHub side effects
- * - missing_tool: records a missing tool capability (metadata only)
- * - missing_data: records missing required data (metadata only)
+ * - report_missing_tool: records a missing tool capability (metadata only)
+ * - report_missing_data: records missing required data (metadata only)
  * - report_incomplete: signals that the task could not be completed (metadata only)
  *
  * All other types — built-in handler types, custom safe job types, and
  * any future types — are logged automatically without needing to update this list.
  * @type {Set<string>}
  */
-const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data", "report_incomplete"]);
+const NOT_LOGGED_TYPES = new Set(["noop", "report_missing_tool", "report_missing_data", "report_incomplete"]);
 
 /**
  * @typedef {Object} ManifestEntry
@@ -116,7 +139,7 @@ function redactManifestValue(value, secretValues) {
     return value.map(entry => redactManifestValue(entry, secretValues));
   }
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, nestedValue]) => [key, redactManifestValue(nestedValue, secretValues)]));
+    return Object.fromEntries(Object.entries(value).map(([key, nestedValue]) => [redactManifestValue(key, secretValues), redactManifestValue(nestedValue, secretValues)]));
   }
   return value;
 }
@@ -131,9 +154,11 @@ function redactManifestValue(value, secretValues) {
  * @returns {(item: {type: string, url?: string, number?: number, repo?: string, provider?: string, id?: string|number, identifier?: string, target?: Object, labels?: Array<{name: string, database_id?: number, node_id?: string}>, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}) => void} Logger function
  */
 function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
+  const identity = currentClaimHandle() ? claimIdentity(currentClaimHandle()) : null;
+  const destination = scopedArtifactFile(manifestFile);
   // Touch the file immediately so it exists for artifact upload
   // even if no items are created during this run.
-  ensureManifestExists(manifestFile);
+  ensureManifestExists(destination);
 
   /**
    * Log an executed safe output item to the manifest file.
@@ -141,11 +166,14 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
    * @param {{type: string, url?: string, number?: number, repo?: string, provider?: string, id?: string|number, identifier?: string, target?: Object, labels?: Array<{name: string, database_id?: number, node_id?: string}>, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}} item - Executed item details
    */
   return function logCreatedItem(item) {
+    if (identity) assertClaimIdentity(identity);
+    else if (currentClaimHandle()) throw new Error("Manifest logger cannot borrow a queue Claim after factory creation");
     if (!item) return;
 
     /** @type {ManifestEntry} */
     const entry = {
       type: item.type,
+      ...(identity || {}),
       ...(item.url ? { url: item.url } : {}),
       ...(item.number != null ? { number: item.number } : {}),
       ...(item.repo ? { repo: item.repo } : {}),
@@ -170,18 +198,20 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
       const redactedEntry = /** @type {ManifestEntry} */ redactManifestValue(entry, secretValues);
       jsonLine = JSON.stringify(redactedEntry);
     } catch (error) {
+      if (identity) throw new Error(`${ERR_SYSTEM}: Failed to redact Claim manifest entry`, { cause: error });
       if (typeof core !== "undefined" && typeof core.warning === "function") {
         core.warning(`Failed to redact safe-output manifest entry (type=${entry.type}); recording minimal fields only to avoid persisting unredacted data: ${getErrorMessage(error)}`);
       }
       jsonLine = JSON.stringify({
         type: entry.type,
+        ...(identity || {}),
         ...(entry.provider ? { provider: entry.provider } : {}),
         ...(entry.number != null ? { number: entry.number } : {}),
         timestamp: entry.timestamp,
       });
     }
     try {
-      fs.appendFileSync(manifestFile, jsonLine + "\n");
+      fs.appendFileSync(destination, jsonLine + "\n", identity ? { mode: 0o600 } : undefined);
     } catch (error) {
       throw new Error(`${ERR_SYSTEM}: Failed to write to manifest file: ${getErrorMessage(error)}`, { cause: error });
     }
@@ -196,9 +226,10 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
  * @param {string} [manifestFile] - Path to the manifest file (defaults to MANIFEST_FILE_PATH)
  */
 function ensureManifestExists(manifestFile = MANIFEST_FILE_PATH) {
+  manifestFile = scopedArtifactFile(manifestFile);
   if (!fs.existsSync(manifestFile)) {
     try {
-      fs.writeFileSync(manifestFile, "");
+      fs.writeFileSync(manifestFile, "", currentClaimHandle() ? { mode: 0o600 } : undefined);
     } catch (error) {
       throw new Error(`${ERR_SYSTEM}: Failed to create manifest file: ${getErrorMessage(error)}`, { cause: error });
     }
@@ -220,7 +251,7 @@ function ensureManifestExists(manifestFile = MANIFEST_FILE_PATH) {
  * @returns {{type: string, url?: string, number?: number, repo?: string, provider?: string, id?: string|number, identifier?: string, target?: Object, labels?: Array<{name: string, database_id?: number, node_id?: string}>, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}|null}
  */
 function extractCreatedItemFromResult(type, result) {
-  if (!result || NOT_LOGGED_TYPES.has(type)) return null;
+  if (!result || NOT_LOGGED_TYPES.has(normalizeSafeOutputName(type))) return null;
 
   // PR reviews are buffered first and only gain durable identity fields after the
   // final submitReview() call, so skip logging placeholder buffer results here.
@@ -254,6 +285,12 @@ function extractCreatedItemFromResult(type, result) {
         }
       : undefined);
   const labels = Array.isArray(result.labels) ? result.labels : Array.isArray(result.labelsAdded) ? result.labelsAdded.map(name => ({ name })) : undefined;
+  const metadata = {
+    ...(result.metadata || {}),
+    ...(type === "dispatch_workflow" && result.run_id != null ? { run_id: result.run_id } : {}),
+    ...(type === "assign_milestone" && result.milestone_number != null ? { milestone_number: result.milestone_number } : {}),
+    ...(type === "push_to_pull_request_branch" && result.commit_sha ? { commit_sha: result.commit_sha } : {}),
+  };
 
   return {
     type,
@@ -266,7 +303,7 @@ function extractCreatedItemFromResult(type, result) {
     ...(target ? { target } : {}),
     ...(labels ? { labels } : {}),
     ...(result.temporaryId ? { temporaryId: result.temporaryId } : {}),
-    ...(result.metadata && Object.keys(result.metadata).length > 0 ? { metadata: result.metadata } : {}),
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     ...(result.before_state ? { before_state: result.before_state } : {}),
     ...(result.after_state ? { after_state: result.after_state } : {}),
     ...(Array.isArray(result.labelsAdded) ? { labelsAdded: result.labelsAdded } : {}),
@@ -285,13 +322,16 @@ function extractCreatedItemFromResult(type, result) {
  * @param {string} [filePath] - Path to the output file (defaults to TEMPORARY_ID_MAP_FILE_PATH)
  */
 function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FILE_PATH) {
+  filePath = scopedArtifactFile(filePath);
   try {
     const dir = nodePath.dirname(filePath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(filePath, JSON.stringify(temporaryIdMap, null, 2) + "\n");
+    const exported = currentClaimHandle() ? redactManifestValue(temporaryIdMap, collectArtifactSecretValues()) : temporaryIdMap;
+    fs.writeFileSync(filePath, JSON.stringify(exported, null, 2) + "\n", currentClaimHandle() ? { mode: 0o600 } : undefined);
   } catch (error) {
+    if (currentClaimHandle()) throw new Error(`${ERR_SYSTEM}: Failed to safely export Claim temporary ID map`, { cause: error });
     throw new Error(`${ERR_SYSTEM}: Failed to write temporary ID map file: ${getErrorMessage(error)}`, { cause: error });
   }
 }
@@ -302,19 +342,21 @@ function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FIL
  * The report captures *structured* failure metadata only (error code, error
  * message produced by gh-aw itself, and the list of failing safe-output types).
  * Raw handler stdout/stderr is never captured. Built-in credential patterns are
- * redacted from the serialized report before it is written to disk.
+ * redacted from decoded fields before JSON serialization.
  *
  * The file is uploaded with the safe-outputs-items artifact (which is uploaded
- * with `if: always()`), so failures of the "Process Safe Outputs" step remain
- * diagnosable after the job logs expire.
+ * after redaction succeeds for Claim workers), so failures of the "Process
+ * Safe Outputs" step remain diagnosable without uploading raw error text.
  *
  * @param {{status?: string, errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string}>}} report - Failure diagnostics
  * @param {string} [filePath] - Path to the output file (defaults to SAFE_OUTPUT_ERRORS_FILE_PATH)
  */
 function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_PATH) {
+  filePath = scopedArtifactFile(filePath);
   /** @type {Record<string, any>} */
   const entry = {
     timestamp: new Date().toISOString(),
+    ...(currentClaimHandle() ? { claim_handle: currentClaimHandle() } : {}),
     status: report?.status || "failure",
     ...(report?.errorCode ? { errorCode: report.errorCode } : {}),
     ...(report?.message ? { message: report.message } : {}),
@@ -329,14 +371,12 @@ function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_P
       : [],
   };
 
-  let content = JSON.stringify(entry, null, 2) + "\n";
+  let content;
   try {
-    content = redactBuiltInPatterns(content).content;
-    content = redactSecrets(content, collectArtifactSecretValues()).content;
+    content = JSON.stringify(redactManifestValue(entry, collectArtifactSecretValues()), null, 2) + "\n";
   } catch {
-    // Redaction is a safety net; if it fails, drop the free-form text rather
-    // than risk writing an unredacted credential into an artifact.
-    content = JSON.stringify({ timestamp: entry.timestamp, status: entry.status, message: "<redaction unavailable: diagnostics omitted>" }, null, 2) + "\n";
+    if (typeof core !== "undefined" && typeof core.warning === "function") core.warning("Safe-output diagnostic redaction failed; free-form diagnostics omitted");
+    content = JSON.stringify({ timestamp: entry.timestamp, status: "failure", message: "<redaction unavailable: diagnostics omitted>" }, null, 2) + "\n";
   }
 
   try {
@@ -344,16 +384,19 @@ function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_P
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(filePath, content);
+    fs.writeFileSync(filePath, content, currentClaimHandle() ? { mode: 0o600 } : undefined);
   } catch (error) {
     throw new Error(`${ERR_SYSTEM}: Failed to write safe output error report: ${getErrorMessage(error)}`, { cause: error });
   }
 }
 
 module.exports = {
+  collectArtifactSecretValues,
+  redactManifestValue,
   MANIFEST_FILE_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
   SAFE_OUTPUT_ERRORS_FILE_PATH,
+  CLAIM_DELIVERY_ERRORS_FILE_NAME,
   CREATE_ITEM_TYPES,
   NOT_LOGGED_TYPES,
   createManifestLogger,

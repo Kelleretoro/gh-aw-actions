@@ -2,12 +2,16 @@
 
 "use strict";
 
+const { readCopilotSDKMCPConfig } = require("./copilot_sdk_mcp_config.cjs");
+const { resolveCopilotSDKMCPConfigPath } = require("./copilot_sdk_mcp_config_path.cjs");
 const { createCopilotSDKWebFetchTool } = require("./copilot_sdk_web_fetch.cjs");
+const { parseMaxToolCalls } = require("./copilot_sdk_tool_budget.cjs");
 
 const COPILOT_SDK_TOOL_CONFIG_VERSION = 1;
 const COPILOT_SDK_NEUTRAL_BUILTIN_TOOLS = Object.freeze(["view", "rg", "glob", "sql"]);
 const COPILOT_SDK_SHELL_BUILTIN_TOOLS = Object.freeze(["bash", "read_bash", "stop_bash", "list_bash"]);
 const COPILOT_SDK_EDIT_BUILTIN_TOOLS = Object.freeze(["apply_patch", "edit", "create", "delete", "move", "write_bash"]);
+const COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS = Object.freeze(["run_dynamic_workflow", "dynamic_workflows_manage"]);
 
 /**
  * @typedef {{
@@ -15,6 +19,7 @@ const COPILOT_SDK_EDIT_BUILTIN_TOOLS = Object.freeze(["apply_patch", "edit", "cr
  *   edit: boolean,
  *   webFetch: boolean,
  *   webSearch: boolean,
+ *   dynamicWorkflows: boolean,
  *   mcp: boolean,
  *   cliProxy: boolean,
  * }} CopilotSDKToolCapabilities
@@ -25,6 +30,7 @@ const COPILOT_SDK_EDIT_BUILTIN_TOOLS = Object.freeze(["apply_patch", "edit", "cr
  *   version: number,
  *   capabilities: CopilotSDKToolCapabilities,
  *   permissions: {allowedTools: string[]},
+ *   maxToolCalls?: number,
  *   explicitlyDisabledTools: string[],
  * }} CopilotSDKToolConfig
  */
@@ -64,11 +70,16 @@ function parseCapabilities(value) {
       throw new Error(`capabilities.${field} must be a boolean`);
     }
   }
+  if (value.dynamicWorkflows !== undefined && typeof value.dynamicWorkflows !== "boolean") {
+    throw new Error("capabilities.dynamicWorkflows must be a boolean");
+  }
   return /** @type {CopilotSDKToolCapabilities} */ {
     bash: Boolean(value.bash),
     edit: Boolean(value.edit),
     webFetch: Boolean(value.webFetch),
     webSearch: Boolean(value.webSearch),
+    // Older version-1 contracts omit this capability and must not expose workflows.
+    dynamicWorkflows: value.dynamicWorkflows === true,
     mcp: Boolean(value.mcp),
     cliProxy: Boolean(value.cliProxy),
   };
@@ -86,7 +97,9 @@ function parseCapabilities(value) {
  * @returns {boolean}
  */
 function isReservedSDKPermission(tool) {
-  return tool === "read" || tool === "write" || tool === "web_fetch" || tool === "web_search" || tool === "shell" || (tool.startsWith("read(") && tool.endsWith(")")) || (tool.startsWith("shell(") && tool.endsWith(")"));
+  return (
+    tool === "read" || tool === "write" || tool === "web_fetch" || tool === "web_search" || tool === "workflow" || tool === "shell" || (tool.startsWith("read(") && tool.endsWith(")")) || (tool.startsWith("shell(") && tool.endsWith(")"))
+  );
 }
 
 /**
@@ -108,6 +121,12 @@ function validateToolPermissionParity(config) {
   }
   if (config.capabilities.webSearch !== allowed.has("web_search")) {
     throw new Error("SDK tool contract mismatch: web_search visibility and permissions differ");
+  }
+  if (config.capabilities.webSearch) {
+    throw new Error("Copilot native web_search is unavailable in offline BYOK mode; configure an MCP search server instead");
+  }
+  if (config.capabilities.dynamicWorkflows !== allowed.has("workflow")) {
+    throw new Error("SDK tool contract mismatch: workflow visibility and permissions differ");
   }
   if (!config.capabilities.mcp && hasMCPPermission) {
     throw new Error("SDK tool contract mismatch: MCP permissions exist while MCP visibility is disabled");
@@ -167,16 +186,75 @@ function parseCopilotSDKToolConfig(value) {
   if (allowedTools.length === 0) {
     throw new Error("permissions.allowedTools must not be empty");
   }
+  const maxToolCalls = Object.hasOwn(parsed, "maxToolCalls") ? parseMaxToolCalls(parsed.maxToolCalls) : undefined;
   const config = {
     version: COPILOT_SDK_TOOL_CONFIG_VERSION,
     capabilities: parseCapabilities(parsed.capabilities),
     permissions: {
       allowedTools,
     },
+    ...(maxToolCalls === undefined ? {} : { maxToolCalls }),
     explicitlyDisabledTools: parsed.explicitlyDisabledTools == null ? [] : parseStringArray(parsed.explicitlyDisabledTools, "explicitlyDisabledTools"),
   };
   validateToolPermissionParity(config);
   return config;
+}
+
+/**
+ * SDK sessions need explicit server registration; allowing MCP tools does not
+ * load the CLI's gateway configuration into the session. Only use the separate
+ * converter-owned catalog, never the user-managed GH_AW_MCP_CONFIG CLI catalog.
+ *
+ * @param {CopilotSDKToolConfig} config
+ * @param {string | undefined} [configPath]
+ * @returns {Record<string, import("@github/copilot-sdk").MCPServerConfig>}
+ */
+function loadCopilotSDKMCPServers(config, configPath) {
+  if (!config.capabilities.mcp) return {};
+  configPath ??= resolveCopilotSDKMCPConfigPath();
+  if (!configPath) throw new Error("Copilot SDK MCP configuration path is required when SDK MCP tools are enabled");
+
+  const source = readCopilotSDKMCPConfig(configPath);
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new Error("Copilot SDK MCP configuration must be valid JSON");
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.mcpServers)) {
+    throw new Error("Copilot SDK MCP configuration must contain an mcpServers object");
+  }
+
+  /** @type {Record<string, import("@github/copilot-sdk").MCPServerConfig>} */
+  const servers = {};
+  for (const [name, entry] of Object.entries(parsed.mcpServers)) {
+    if (!isRecord(entry) || (entry.type !== "http" && entry.type !== "sse") || typeof entry.url !== "string") {
+      throw new Error("Copilot SDK MCP configuration servers must use the generated HTTP gateway configuration");
+    }
+    /** @type {import("@github/copilot-sdk").MCPHTTPServerConfig} */
+    const server = { type: entry.type === "http" ? "http" : "sse", url: entry.url };
+    if (entry.tools !== undefined) {
+      if (!Array.isArray(entry.tools) || entry.tools.some(tool => typeof tool !== "string" || tool.trim() === "")) {
+        throw new Error("MCP server tools must be an array of non-empty strings");
+      }
+      server.tools = [...new Set(entry.tools.map(tool => tool.trim()))];
+    }
+    if (entry.timeout !== undefined) {
+      if (typeof entry.timeout !== "number" || !Number.isFinite(entry.timeout) || entry.timeout <= 0) {
+        throw new Error("MCP server timeout must be a positive number");
+      }
+      server.timeout = entry.timeout;
+    }
+    if (entry.headers !== undefined) {
+      if (!isRecord(entry.headers) || Object.values(entry.headers).some(value => typeof value !== "string")) {
+        throw new Error("MCP server headers must be an object of strings");
+      }
+      server.headers = Object.fromEntries(Object.entries(entry.headers).map(([key, value]) => [key, String(value)]));
+    }
+    // Preserve names such as __proto__ as own keys without invoking inherited setters.
+    Object.defineProperty(servers, name, { value: server, enumerable: true, configurable: true, writable: true });
+  }
+  return servers;
 }
 
 /**
@@ -196,14 +274,14 @@ function buildCopilotSDKSessionToolConfig(config, sdk, options = {}) {
   }
 
   const availableTools = new sdk.ToolSet();
-  availableTools.addBuiltIn(sdk.BuiltInTools.Isolated.filter(name => name !== "ask_user"));
+  availableTools.addBuiltIn(sdk.BuiltInTools.Isolated.filter(name => name !== "ask_user" && !COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS.includes(name)));
   availableTools.addBuiltIn(COPILOT_SDK_NEUTRAL_BUILTIN_TOOLS);
   if (config.capabilities.bash) availableTools.addBuiltIn(COPILOT_SDK_SHELL_BUILTIN_TOOLS);
   if (config.capabilities.edit) availableTools.addBuiltIn(COPILOT_SDK_EDIT_BUILTIN_TOOLS);
-  // web_search is a Copilot SDK built-in tool; the compiler emits webSearch: true
-  // only when the workflow declares tools.web-search, and the parity check above
-  // makes a stray webSearch: true without a matching permission fail closed.
-  if (config.capabilities.webSearch) availableTools.addBuiltIn("web_search");
+  if (config.capabilities.webSearch) {
+    throw new Error("Copilot native web_search is unavailable in offline BYOK mode; configure an MCP search server instead");
+  }
+  if (config.capabilities.dynamicWorkflows) availableTools.addBuiltIn(COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS);
   if (config.capabilities.mcp) availableTools.addMcp("*");
   // cliProxy mounts MCP servers as CLI wrapper scripts on PATH; those scripts are
   // invoked through the bash builtin (already added above when capabilities.bash
@@ -226,10 +304,12 @@ function buildCopilotSDKSessionToolConfig(config, sdk, options = {}) {
 }
 
 module.exports = {
+  loadCopilotSDKMCPServers,
   COPILOT_SDK_TOOL_CONFIG_VERSION,
   COPILOT_SDK_NEUTRAL_BUILTIN_TOOLS,
   COPILOT_SDK_SHELL_BUILTIN_TOOLS,
   COPILOT_SDK_EDIT_BUILTIN_TOOLS,
+  COPILOT_SDK_WORKFLOW_BUILTIN_TOOLS,
   parseStringArray,
   parseCapabilities,
   isReservedSDKPermission,

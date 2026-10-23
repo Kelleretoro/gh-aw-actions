@@ -44,6 +44,7 @@ REQUIRED_DEPS=(
   "issue_title_dedup.cjs"
   "safe_outputs_tools_loader.cjs"
   "safe_outputs_config.cjs"
+  "safe_output_names.cjs"
   "safe_outputs_config_redact.cjs"
   "checkout_manifest.cjs"
 )
@@ -89,9 +90,9 @@ mkdir -p /tmp/gh-aw/mcp-logs/safeoutputs
   echo ""
 } > /tmp/gh-aw/mcp-logs/safeoutputs/server.log
 
-# Start the HTTP server in the background with DEBUG enabled
+# Start the HTTP server in the background
 echo "Starting safe-outputs MCP HTTP server..."
-DEBUG="*" node mcp-server.cjs >> /tmp/gh-aw/mcp-logs/safeoutputs/server.log 2>&1 &
+node mcp-server.cjs >> /tmp/gh-aw/mcp-logs/safeoutputs/server.log 2>&1 &
 SERVER_PID=$!
 echo "Started safe-outputs MCP server with PID $SERVER_PID"
 

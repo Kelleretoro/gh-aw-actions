@@ -1,6 +1,8 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { createReportIssue } = require("./issue_report.cjs");
+
 /** @type {typeof import("fs")} */
 const fs = require("fs");
 /** @type {typeof import("crypto")} */
@@ -18,6 +20,7 @@ const { addExpirationToFooter } = require("./ephemerals.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { assembleMarkdownBodyParts } = require("./markdown_body_helpers.cjs");
+const { appendExecutionProvenance, stripExecutionProvenance } = require("./execution_provenance.cjs");
 const { getBodyHeader, getDisclosureHeader } = require("./messages_header.cjs");
 const { getBodyFooterMessage } = require("./messages_footer.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
@@ -34,14 +37,16 @@ const { renderTemplateFromFile, renderFilesList, buildProtectedFileList, getProm
 const { withGitHubHostToken } = require("./git_auth_helpers.cjs");
 const { COPILOT_REVIEWER_BOT, FAQ_CREATE_PR_PERMISSIONS_URL } = require("./constants.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { preparePullRequestDelivery, capturePullRequestDelivery } = require("./work_queue_native_creation_delivery.cjs");
 const { extractPatchBaseCommit } = require("./commit_sha_helpers.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { createOrUpdatePullRequest } = require("./create_or_update_pull_request.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
-const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, getBundlePrerequisites, isShallowOrSparseCheckout, linearizeRangeAsCommit } = require("./git_helpers.cjs");
+const { ensureFullHistoryForBundle, importLocalBundle, offlineGitOptions, getBundlePrerequisites, linearizeRangeAsCommit } = require("./git_helpers.cjs");
 const { parseDiffGitHeader: parseDiffGitHeaderPaths, extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
 const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { withTransportIntegrity } = require("./transport_integrity.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
 const {
   MANAGED_FALLBACK_ISSUE_LABEL,
   LABEL_MAX_RETRIES,
@@ -221,137 +226,31 @@ function parseAutoMergeConfig(value) {
 
 /**
  * Apply a git bundle to a local branch without fetching directly into the branch ref.
- * Fetching directly into refs/heads/<branch> fails when that branch is currently checked out.
+ * Import through a temporary ref before updating a branch that may be checked out.
  *
  * @param {string} bundleFilePath - Path to the bundle file
  * @param {string} branchName - Target branch name
  * @param {string} originalAgentBranch - Original source branch name from the agent, if different
  * @param {{ exec: Function, getExecOutput: Function }} execApi - GitHub Actions exec API
- * @param {string} [baseBranch] - Base branch name (used for iterative shallow-clone deepening)
+ * @param {boolean} [allowFullHistoryFetch=false] - Explicit opt-in to unbounded prerequisite recovery.
  * @returns {Promise<void>}
  */
-async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, execApi, baseBranch) {
-  let bundleBranchRef = `refs/heads/${originalAgentBranch || branchName}`;
+async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, execApi, allowFullHistoryFetch = false) {
+  const bundleBranchRef = `refs/heads/${originalAgentBranch || branchName}`;
   const bundleTargetRef = `refs/heads/${branchName}`;
   const bundleTempRef = createBundleTempRef(branchName);
 
   try {
-    await ensureFullHistoryForBundle(execApi, {}, { baseRef: baseBranch, bundleFilePath });
+    await ensureFullHistoryForBundle(execApi, {}, { bundleFilePath, allowFullHistoryFetch });
     core.info(`Applying bundle ${bundleFilePath} to ${bundleTargetRef} using temp ref ${bundleTempRef} from ${bundleBranchRef}`);
 
-    // Fetch from bundle into a temporary ref, then update the target branch.
-    // bundleBranchRef is the source ref inside the bundle (typically refs/heads/<agent-branch>).
-    // Use getExecOutput with ignoreReturnCode so we can read the actual stderr from git —
-    // exec() only throws "The process '...' failed with exit code 1" which loses the
-    // "lacks these prerequisite commits" text needed for the recovery path below.
-    core.info(`Attempting bundle fetch from ${bundleBranchRef} into ${bundleTempRef}`);
-    const initialBundleFetch = await execApi.getExecOutput("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`], { ignoreReturnCode: true });
-    if (initialBundleFetch.exitCode !== 0) {
-      const initialFetchErrorOutput = initialBundleFetch.stderr || `exit code ${initialBundleFetch.exitCode}`;
-
-      // Recovery path for bundle prerequisite failures: fetch missing prerequisite
-      // commit objects, then retry with the original bundle ref.
-      // This handles the race where main advanced between agent-time and safe_outputs-time:
-      // the bundle's base commit may not be reachable from a fetch-depth:1 shallow clone
-      // (e.g. when the commit is on a ref not in the fetch refspec).
-      const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
-      if (prerequisiteCommits.length > 0) {
-        core.warning(`Bundle fetch with ${bundleBranchRef} failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
-        core.info(`Prerequisite commits: ${summarizeListForLog(prerequisiteCommits)}`);
-        core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
-        // Use --filter=blob:none only when the local repo is already shallow or sparse —
-        // in a full clone we already have all blobs and must not convert the repo to a
-        // partial clone (which would trigger lazy blob fetches on later operations).
-        const useBlobFilter = await isShallowOrSparseCheckout(execApi);
-        const prerequisiteFetchArgs = useBlobFilter ? ["fetch", "--filter=blob:none", "origin", ...prerequisiteCommits] : ["fetch", "origin", ...prerequisiteCommits];
-        if (useBlobFilter) {
-          core.info("Using --filter=blob:none for prerequisite fetch (shallow or sparse checkout detected)");
-        }
-        await execApi.exec("git", prerequisiteFetchArgs);
-        core.info("Fetched prerequisite commits from origin successfully");
-        try {
-          core.info(`Retrying bundle fetch from ${bundleBranchRef} into ${bundleTempRef} after prerequisite recovery`);
-          await execApi.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`]);
-          core.info("Bundle fetch retry succeeded after prerequisite recovery");
-        } catch (retryError) {
-          throw new Error(`Bundle fetch failed after fetching ${prerequisiteCommits.length} prerequisite commit(s): ${getErrorMessage(retryError)}`, { cause: retryError });
-        }
-      } else {
-        // Fallback: resolve the source ref directly from the bundle contents.
-        // Some agents may emit a JSONL branch name that differs from the ref embedded in the bundle.
-        core.warning(`Bundle fetch with ${bundleBranchRef} failed: ${initialFetchErrorOutput}; resolving branch ref from bundle heads`);
-        core.info(`Inspecting bundle heads from ${bundleFilePath}`);
-        const { stdout: bundleHeadsOutput } = await execApi.getExecOutput("git", ["bundle", "list-heads", bundleFilePath]);
-        const branchRefs = bundleHeadsOutput
-          .split("\n")
-          .map(line => line.trim().split(/\s+/)[1] || "")
-          .filter(ref => /^refs\/heads\/[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(ref));
-        core.info(`Bundle list-heads returned ${branchRefs.length} candidate branch ref(s): ${summarizeListForLog(branchRefs)}`);
-
-        if (branchRefs.length === 1) {
-          bundleBranchRef = branchRefs[0];
-          core.info(`Resolved bundle source ref from list-heads: ${bundleBranchRef}`);
-          core.info(`Fetching resolved bundle ref ${bundleBranchRef} into ${bundleTempRef}`);
-          await execApi.exec("git", ["fetch", bundleFilePath, `${bundleBranchRef}:${bundleTempRef}`]);
-        } else if (branchRefs.length === 0) {
-          // Bundle contains only HEAD (no refs/heads/* entry). This happens when the
-          // agent created the bundle with `git bundle create <file> HEAD` rather than
-          // including a named branch ref.  Fetch using the HEAD refspec directly so
-          // the bundle objects become accessible, then point the temp ref at them.
-          const headLine = bundleHeadsOutput
-            .split("\n")
-            .map(line => line.trim())
-            .find(line => /^[0-9a-f]{40}\s+HEAD$/.test(line));
-          if (headLine) {
-            core.info(`Bundle has no refs/heads entries; fetching HEAD directly into ${bundleTempRef}`);
-            // Use getExecOutput with ignoreReturnCode so we can read actual stderr
-            // and perform prerequisite recovery before failing — same pattern as the
-            // initial bundle fetch above.  When the agent ran on a non-default branch
-            // the bundle prerequisite is that branch tip, which isn't reachable from
-            // the local main-only checkout, so a bare exec() would throw and lose the
-            // "lacks these prerequisite commits" text needed for recovery.
-            const headBundleFetch = await execApi.getExecOutput("git", ["fetch", bundleFilePath, `HEAD:${bundleTempRef}`], { ignoreReturnCode: true });
-            if (headBundleFetch.exitCode !== 0) {
-              const headFetchErrorOutput = headBundleFetch.stderr || `exit code ${headBundleFetch.exitCode}`;
-              const headPrereqCommits = extractBundlePrerequisiteCommits(headFetchErrorOutput);
-              if (headPrereqCommits.length > 0) {
-                core.warning(`HEAD bundle fetch failed due to ${headPrereqCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
-                core.info(`Prerequisite commits: ${summarizeListForLog(headPrereqCommits)}`);
-                const useBlobFilter = await isShallowOrSparseCheckout(execApi);
-                const headPrereqFetchArgs = useBlobFilter ? ["fetch", "--filter=blob:none", "origin", ...headPrereqCommits] : ["fetch", "origin", ...headPrereqCommits];
-                if (useBlobFilter) {
-                  core.info("Using --filter=blob:none for prerequisite fetch (shallow or sparse checkout detected)");
-                }
-                await execApi.exec("git", headPrereqFetchArgs);
-                core.info("Fetched HEAD bundle prerequisite commits from origin successfully");
-                try {
-                  core.info(`Retrying HEAD bundle fetch into ${bundleTempRef} after prerequisite recovery`);
-                  await execApi.exec("git", ["fetch", bundleFilePath, `HEAD:${bundleTempRef}`]);
-                  core.info("HEAD bundle fetch retry succeeded after prerequisite recovery");
-                } catch (retryError) {
-                  const retryErrorMessage = getErrorMessage(retryError);
-                  throw new Error(`HEAD bundle fetch failed after fetching ${headPrereqCommits.length} prerequisite commit(s): ${retryErrorMessage}`, {
-                    cause: retryError,
-                  });
-                }
-              } else {
-                throw new Error(`Failed to apply HEAD-only bundle: ${headFetchErrorOutput}`);
-              }
-            }
-          } else {
-            throw new Error(`Failed to resolve bundle branch ref from list-heads: bundle contains no refs/heads entries and no HEAD ref`);
-          }
-        } else {
-          throw new Error(`Failed to resolve bundle branch ref from list-heads: expected exactly 1 refs/heads entry, found ${branchRefs.length}`);
-        }
-      }
-    }
-    core.info(`Fetched bundle to ${bundleTempRef}`);
+    await importLocalBundle(execApi, bundleFilePath, bundleBranchRef, bundleTempRef);
+    core.info(`Imported local bundle to ${bundleTempRef}`);
     await execApi.exec("git", ["update-ref", bundleTargetRef, bundleTempRef]);
     core.info(`Created local branch ${branchName} from bundle`);
-    await execApi.exec("git", ["checkout", branchName]);
+    await execApi.exec("git", ["checkout", branchName], offlineGitOptions());
     // Ensure the working tree matches the new HEAD in case checkout left any index/working tree drift.
-    await execApi.exec("git", ["reset", "--hard"]);
+    await execApi.exec("git", ["reset", "--hard"], offlineGitOptions());
     core.info(`Checked out branch ${branchName} from bundle`);
   } finally {
     try {
@@ -373,10 +272,10 @@ async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBran
  * revert or absorb commits that were added to the base branch after the agent's checkout.
  *
  * @param {string} baseBranch
- * @param {{ exec: Function, getExecOutput: Function }} execApi
+ * @param {{ exec: Function, getExecOutput: Function, registerRewriteCleanup?: (originalHead: string, gitOpts?: Object) => () => void }} execApi
  * @param {string} [bundleFilePath] - Optional path to the bundle file; used to extract the
  *   precise base commit the agent worked from.
- * @param {{ excludedFiles?: string[] }} [options]
+ * @param {{ excludedFiles?: string[], gitOpts?: Object }} [options]
  * @returns {Promise<void>}
  */
 async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi, bundleFilePath, options = {}) {
@@ -394,7 +293,7 @@ async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi, bundleFile
         // fall back cleanly rather than letting linearizeRangeAsCommit abort mid-run.
         const prereqSha = prereqs[0];
         try {
-          const { exitCode } = await execApi.getExecOutput("git", ["cat-file", "-e", `${prereqSha}^{commit}`], { ignoreReturnCode: true, silent: true });
+          const { exitCode } = await execApi.getExecOutput("git", ["cat-file", "-e", `${prereqSha}^{commit}`], { ...offlineGitOptions(), ignoreReturnCode: true });
           if (exitCode === 0) {
             baseRef = prereqSha;
             core.info(`Using bundle prerequisite commit ${baseRef} as linearization base (avoids including base-branch drift)`);
@@ -425,10 +324,15 @@ async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi, bundleFile
   }
 
   core.warning(`Rewriting bundled commits to a single linear commit for signed push compatibility (base: ${baseRef})`);
+  const gitArgs = options.gitOpts ? [options.gitOpts] : [];
+  const { stdout: originalHeadOut } = await execApi.getExecOutput("git", ["rev-parse", "HEAD"], ...gitArgs);
+  const releaseRewriteCleanup = execApi.registerRewriteCleanup?.(originalHeadOut.trim(), options.gitOpts || { cwd: process.cwd() });
   const newHead = await linearizeRangeAsCommit(baseRef, commitHeadline, execApi, {
+    ...(options.gitOpts ? { gitOpts: options.gitOpts } : {}),
     excludedFiles: options.excludedFiles,
     rebaseOnto: fallbackBaseRef,
   });
+  releaseRewriteCleanup?.();
   core.info(`Bundle rewrite completed (new HEAD: ${newHead})`);
 }
 
@@ -450,9 +354,11 @@ async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi, bundleFile
  * @param {string} body - Issue body
  * @param {string[]} labels - Issue labels
  * @param {string[] | null} assignees - Sanitized assignees (null = omit field)
+ * @param {() => void} assertUnchanged - Check captured transport before each publication attempt
  * @returns {Promise<{data: any, issueRepoParts: {owner: string, repo: string}}>}
  */
-async function createFallbackIssue(githubClient, repoParts, title, body, labels, assignees) {
+async function createFallbackIssue(githubClient, repoParts, title, body, labels, assignees, assertUnchanged) {
+  body = appendExecutionProvenance(body, process.env.GH_AW_WORKFLOW_NAME || "Workflow", "");
   if (body.length > MAX_GITHUB_BODY_LENGTH) {
     throw new Error(`Fallback issue body exceeds GitHub's maximum length of ${MAX_GITHUB_BODY_LENGTH} characters`);
   }
@@ -483,9 +389,12 @@ async function createFallbackIssue(githubClient, repoParts, title, body, labels,
   const triedOwnerRepos = new Set();
   const innerCreate = async () => {
     try {
-      const response = await githubClient.rest.issues.create(payload);
+      assertUnchanged();
+      const response = await createReportIssue(githubClient, payload);
+      assertUnchanged();
       return { ...response, issueRepoParts: { owner: payload.owner, repo: payload.repo } };
     } catch (error) {
+      assertUnchanged();
       const status = typeof error === "object" && error !== null && "status" in error ? error.status : undefined;
       const message = getErrorMessage(error).toLowerCase();
       const isAssigneeError = status === 422 && (message.includes("assignee") || message.includes("assignees") || message.includes("unprocessable"));
@@ -660,6 +569,7 @@ function enforcePullRequestLimits(patchContent, maxFiles = MAX_FILES) {
  * @param {string} [options.remoteTarget] - Remote name or URL used for remote branch existence checks.
  * @param {string} [options.remoteToken] - Optional token used for authenticated remote branch checks.
  * @param {string} [options.cwd] - Optional working directory for git operations; scopes git config overrides to the correct checkout.
+ * @param {() => void} [options.assertTransportUnchanged]
  * @returns {Promise<string>} The (possibly renamed) branch name to use going forward.
  */
 async function handleRemoteBranchCollision(branchName, preserveBranchName, options = {}) {
@@ -674,11 +584,13 @@ async function handleRemoteBranchCollision(branchName, preserveBranchName, optio
     } else {
       checkResult = await checkRemoteBranch();
     }
+    options.assertTransportUnchanged?.();
     const { stdout } = checkResult;
     if (stdout.trim()) {
       remoteBranchExists = true;
     }
   } catch (checkError) {
+    options.assertTransportUnchanged?.();
     core.info(`Remote branch check failed (non-fatal): ${getErrorMessage(checkError)}`);
   }
 
@@ -711,9 +623,11 @@ async function handleRemoteBranchCollision(branchName, preserveBranchName, optio
     core.warning(`Remote branch ${branchName} already exists - reusing it (recreate-ref enabled, force-deleting remote ref)`);
     let deleteBlocked = false;
     try {
+      options.assertTransportUnchanged?.();
       await githubClient.rest.git.deleteRef({ owner, repo, ref: `heads/${branchName}` });
       core.info(`Deleted remote branch ${branchName} to reuse it`);
     } catch (deleteError) {
+      options.assertTransportUnchanged?.();
       /** @type {any} */
       const err = deleteError;
       const status = err && typeof err === "object" ? err.status : undefined;
@@ -753,6 +667,7 @@ async function handleRemoteBranchCollision(branchName, preserveBranchName, optio
  * @type {HandlerFactoryFunction}
  */
 async function main(config = {}) {
+  const activationCommentLinks = config._activationCommentLinks ?? [];
   // Extract configuration
   const rawBranchPrefix = config.branch_prefix || "";
   const normalizedBranchPrefix = normalizeBranchName(rawBranchPrefix);
@@ -794,11 +709,11 @@ async function main(config = {}) {
   const stackTracker = createStackTracker();
   const githubClient = await createAuthenticatedGitHubClient(config);
   const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
-  let allowedMentionAliases = [];
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   // Check if copilot assignment is enabled for fallback issues
@@ -979,7 +894,8 @@ async function main(config = {}) {
    * @param {Object} resolvedTemporaryIds - Map of temporary IDs to {repo, number}
    * @returns {Promise<Object>} Result with success/error status and PR details
    */
-  return async function handleCreatePullRequest(message, resolvedTemporaryIds) {
+  return withTransportIntegrity(async function handleCreatePullRequest(message, resolvedTemporaryIds, transport) {
+    const exec = transport.guardExec(globalThis.exec);
     // Check if we've hit the max limit
     if (processedCount >= maxCount) {
       core.warning(`Skipping create_pull_request: max count of ${maxCount} reached`);
@@ -1002,10 +918,19 @@ async function main(config = {}) {
 
     core.info(`Processing create_pull_request: title=${pullRequestItem.title || "No title"}, bodyLength=${pullRequestItem.body?.length || 0}`);
 
+    const repoResult = resolveAndValidateRepo(pullRequestItem, defaultTargetRepo, allowedRepos, "pull request");
+    if (!repoResult.success) {
+      core.warning(`Skipping pull request: ${repoResult.error}`);
+      return { success: false, error: repoResult.error };
+    }
+    const { repo: itemRepo, repoParts } = repoResult;
+
     // Determine the patch and bundle file paths. The MCP server sets these on
     // the entry it writes, but the validation step strips them as a defense
     // against agent-forged values. Recover them by re-deriving from `branch`.
-    const transportPaths = resolveTransportPaths(pullRequestItem, defaultTargetRepo);
+    const transportPaths = resolveTransportPaths(pullRequestItem, itemRepo);
+    transport.captureOptional(transportPaths.patchPath);
+    transport.captureOptional(transportPaths.bundlePath);
     const patchFilePath = transportPaths.patchPath;
     core.info(`Patch file path: ${patchFilePath || "(not set)"}`);
 
@@ -1014,16 +939,7 @@ async function main(config = {}) {
     if (bundleFilePath) {
       core.info(`Bundle file path: ${bundleFilePath}`);
     }
-    // Resolve and validate target repository
-    const repoResult = resolveAndValidateRepo(pullRequestItem, defaultTargetRepo, allowedRepos, "pull request");
-    if (!repoResult.success) {
-      core.warning(`Skipping pull request: ${repoResult.error}`);
-      return {
-        success: false,
-        error: repoResult.error,
-      };
-    }
-    const { repo: itemRepo, repoParts } = repoResult;
+    const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
     core.info(`Target repository: ${itemRepo}`);
     let pushRepo = itemRepo;
     let pushRepoParts = repoParts;
@@ -1230,6 +1146,7 @@ async function main(config = {}) {
       // Check if patch file exists and has valid content.
       // Always require patch content for policy enforcement, even when bundle transport
       // is used for apply-time commit transport.
+      transport.assertUnchanged();
       const hasBundleFile = !!(bundleFilePath && fs.existsSync(bundleFilePath));
       const applyTransport = hasBundleFile ? "bundle" : "patch";
       core.info(`Apply transport mode: ${applyTransport} (bundle file present: ${hasBundleFile})`);
@@ -1277,7 +1194,7 @@ async function main(config = {}) {
       let isEmpty = true;
       if (hasPatchFile) {
         try {
-          patchContent = fs.readFileSync(patchFilePath, "utf8");
+          patchContent = transport.read(patchFilePath).toString("utf8");
         } catch (err) {
           throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
         }
@@ -1321,10 +1238,11 @@ async function main(config = {}) {
         });
 
         try {
-          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, fallbackTitle, fallbackBody, fallbackLabels, configAssignees);
+          transport.assertUnchanged();
+          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, fallbackTitle, fallbackBody, fallbackLabels, configAssignees, transport.assertUnchanged);
           core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
           await assignCopilotToFallbackIssueIfEnabled(issueRepoParts.owner, issueRepoParts.repo, issue.number);
-          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue", { activationCommentLinks });
           return {
             success: true,
             fallback_used: true,
@@ -1480,7 +1398,7 @@ async function main(config = {}) {
         if (patchFilePath && fs.existsSync(patchFilePath)) {
           let patchStats;
           try {
-            patchStats = fs.readFileSync(patchFilePath, "utf8");
+            patchStats = transport.read(patchFilePath).toString("utf8");
           } catch (err) {
             throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
           }
@@ -1648,7 +1566,7 @@ async function main(config = {}) {
       // Snapshot the body content (without footer) for use in protected-files fallback ordering.
       // The protected-files section must appear before the footer (including guard notices such as
       // the integrity-filtering note) so that the footer always comes last in the issue body.
-      const mainBodyContent = bodyLines.join("\n").trim();
+      const mainBodyContent = stripExecutionProvenance(bodyLines.join("\n").trim());
       const issueSafeMainBodyContent = neutralizeClosingKeywordsForIssueBody(mainBodyContent);
 
       // Generate footer using messages template system (respects custom messages.footer config)
@@ -1715,10 +1633,10 @@ async function main(config = {}) {
       bodyLines.push("");
 
       // Prepare the body content
-      const body = bodyLines.join("\n").trim();
+      const body = appendExecutionProvenance(bodyLines.join("\n").trim(), workflowName, runUrl);
       const issueSafeBody = neutralizeClosingKeywordsForIssueBody(body);
       // Footer section (footer + workflow-id marker) used when ordering protected-files notices
-      const footerContent = footerParts.join("\n\n");
+      const footerContent = appendExecutionProvenance(footerParts.join("\n\n"), workflowName, runUrl);
       const issueSafeFooterContent = neutralizeClosingKeywordsForIssueBody(footerContent);
       const hiddenFallbackMetadata = [callerWorkflowId && generateWorkflowCallIdMarker(callerWorkflowId), closeOlderKey && generateCloseKeyMarker(closeOlderKey)].filter(Boolean).join("\n");
       const issueSafeFallbackFooter = [issueSafeFooterContent, hiddenFallbackMetadata].filter(Boolean).join("\n");
@@ -1808,10 +1726,11 @@ async function main(config = {}) {
         // unlike git format-patch which flattens history and drops merge resolution content.
         core.info(`Applying changes from bundle: ${bundleFilePath}`);
         try {
-          await applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, exec, baseBranch);
+          await applyBundleToBranch(bundleFilePath, branchName, originalAgentBranch, exec, config.allow_full_history_fetch === true);
         } catch (bundleError) {
+          transport.assertUnchanged();
           core.error(`Failed to apply bundle: ${getErrorMessage(bundleError)}`);
-          return { success: false, error: "Failed to apply bundle" };
+          return { success: false, error: `Failed to apply bundle: ${getErrorMessage(bundleError)}` };
         }
 
         // Push the commits from the bundle to the remote branch
@@ -1821,7 +1740,9 @@ async function main(config = {}) {
         {
           const forkCwd = process.cwd();
           const runBundlePush = async () => {
+            transport.assertUnchanged();
             branchName = await handleRemoteBranchCollision(branchName, preserveBranchName, {
+              assertTransportUnchanged: transport.assertUnchanged,
               recreateRef,
               githubClient: pushGithubClient,
               owner: pushRepoParts.owner,
@@ -1831,7 +1752,9 @@ async function main(config = {}) {
               cwd: forkCwd,
             });
 
+            transport.assertUnchanged();
             await pushSignedCommits({
+              assertTransportUnchanged: transport.assertUnchanged,
               githubClient: pushGithubClient,
               owner: pushRepoParts.owner,
               repo: pushRepoParts.repo,
@@ -1859,6 +1782,7 @@ async function main(config = {}) {
               core.info("Could not count new commits - extra empty commit will be skipped");
             }
           } catch (initialPushError) {
+            transport.assertUnchanged();
             /** @type {unknown} */
             let pushError = initialPushError;
             let pushRecovered = false;
@@ -1871,8 +1795,10 @@ async function main(config = {}) {
                 await rewriteBundleBranchAsSingleCommit(baseBranch, exec, bundleFilePath, {
                   excludedFiles: Array.isArray(config.excluded_files) ? config.excluded_files : [],
                 });
-                const runRetryPush = async () =>
-                  pushSignedCommits({
+                const runRetryPush = async () => {
+                  transport.assertUnchanged();
+                  return pushSignedCommits({
+                    assertTransportUnchanged: transport.assertUnchanged,
                     githubClient: pushGithubClient,
                     owner: pushRepoParts.owner,
                     repo: pushRepoParts.repo,
@@ -1886,6 +1812,7 @@ async function main(config = {}) {
                     currentRepo: itemRepo,
                     validationConfig: config,
                   });
+                };
                 await runRetryPush();
                 core.info("Changes pushed to branch after bundle rewrite retry");
 
@@ -1898,6 +1825,7 @@ async function main(config = {}) {
                 }
                 pushRecovered = true;
               } catch (retryPushError) {
+                transport.assertUnchanged();
                 pushError = retryPushError;
               }
             }
@@ -1965,11 +1893,12 @@ gh pr create --title ${shellQuote(title)} --base ${shellQuote(baseBranch)} --hea
 ${issueSafeFallbackFooter}`;
 
                 try {
-                  const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
+                  transport.assertUnchanged();
+                  const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees, transport.assertUnchanged);
 
                   core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
                   await assignCopilotToFallbackIssueIfEnabled(issueRepoParts.owner, issueRepoParts.repo, issue.number);
-                  await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+                  await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue", { activationCommentLinks });
 
                   return {
                     success: true,
@@ -2042,7 +1971,7 @@ ${issueSafeFallbackFooter}`;
             if (patchContent !== originalPatchContent) {
               core.info("Resolved temporary ID references in patch content");
               try {
-                fs.writeFileSync(patchFilePath, patchContent, "utf8");
+                transport.transform(patchFilePath, () => Buffer.from(patchContent, "utf8"));
               } catch (err) {
                 throw new Error(`Failed to write file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
               }
@@ -2067,6 +1996,7 @@ ${issueSafeFallbackFooter}`;
             core.info("Patch applied successfully");
             patchApplied = true;
           } catch (patchError) {
+            transport.assertUnchanged();
             core.error(`Failed to apply patch with --3way: ${getErrorMessage(patchError)}`);
 
             const recoveredFromAddAddConflict = await tryRecoverGitAmAddAddConflict(exec);
@@ -2095,7 +2025,7 @@ ${issueSafeFallbackFooter}`;
 
               // Abort the failed git am before attempting any fallback
               try {
-                await exec.exec("git am --abort");
+                await exec.exec("git", ["am", "--abort"]);
                 core.info("Aborted failed git am");
               } catch (abortError) {
                 core.warning(`Failed to abort git am: ${getErrorMessage(abortError)}`);
@@ -2146,6 +2076,7 @@ ${issueSafeFallbackFooter}`;
                     await capturePostApplyBaseRef();
                     await exec.exec("git", ["am", "--3way", patchFilePath]);
                   } catch (fallbackPatchError) {
+                    transport.assertUnchanged();
                     core.warning(`Fallback git am --3way failed: ${getErrorMessage(fallbackPatchError)}`);
                     const recoveredFallback = await tryRecoverGitAmAddAddConflict(exec);
                     if (!recoveredFallback.recovered) {
@@ -2153,7 +2084,7 @@ ${issueSafeFallbackFooter}`;
                         core.warning(`Automatic add/add conflict recovery attempt failed during fallback: ${recoveredFallback.errorMessage}`);
                       }
                       try {
-                        await exec.exec("git am --abort");
+                        await exec.exec("git", ["am", "--abort"]);
                       } catch (abortFallbackError) {
                         core.warning(`Failed to abort fallback git am: ${getErrorMessage(abortFallbackError)}`);
                       }
@@ -2166,6 +2097,7 @@ ${issueSafeFallbackFooter}`;
                   patchApplied = true;
                 }
               } catch (fallbackError) {
+                transport.assertUnchanged();
                 core.warning(`Fallback to original base commit failed: ${getErrorMessage(fallbackError)}`);
               }
             }
@@ -2216,7 +2148,9 @@ ${issueSafeFallbackFooter}`;
           {
             const forkCwd = process.cwd();
             const runPatchPush = async () => {
+              transport.assertUnchanged();
               branchName = await handleRemoteBranchCollision(branchName, preserveBranchName, {
+                assertTransportUnchanged: transport.assertUnchanged,
                 recreateRef,
                 githubClient: pushGithubClient,
                 owner: pushRepoParts.owner,
@@ -2226,7 +2160,9 @@ ${issueSafeFallbackFooter}`;
                 cwd: forkCwd,
               });
 
+              transport.assertUnchanged();
               await pushSignedCommits({
+                assertTransportUnchanged: transport.assertUnchanged,
                 githubClient: pushGithubClient,
                 owner: pushRepoParts.owner,
                 repo: pushRepoParts.repo,
@@ -2256,6 +2192,7 @@ ${issueSafeFallbackFooter}`;
                 core.info("Could not count new commits - extra empty commit will be skipped");
               }
             } catch (pushError) {
+              transport.assertUnchanged();
               // Push failed - create fallback issue instead of PR (if fallback is enabled)
               core.error(`Git push failed: ${getErrorMessage(pushError)}`);
 
@@ -2286,7 +2223,7 @@ ${issueSafeFallbackFooter}`;
                 if (patchFilePath && fs.existsSync(patchFilePath)) {
                   let patchContent;
                   try {
-                    patchContent = fs.readFileSync(patchFilePath, "utf8");
+                    patchContent = transport.read(patchFilePath).toString("utf8");
                   } catch (err) {
                     throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
                   }
@@ -2337,7 +2274,8 @@ ${patchPreview}
 ${issueSafeFallbackFooter}`;
 
                 try {
-                  const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
+                  transport.assertUnchanged();
+                  const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees, transport.assertUnchanged);
 
                   core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
                   await assignCopilotToFallbackIssueIfEnabled(issueRepoParts.owner, issueRepoParts.repo, issue.number);
@@ -2346,7 +2284,7 @@ ${issueSafeFallbackFooter}`;
                   //
                   // NOTE: we pass 'github' (global octokit) instead of githubClient (repo-scoped octokit) because the issue is created
                   // in the same repo as the activation, so the global client has the correct context for updating the comment.
-                  await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+                  await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue", { activationCommentLinks });
 
                   // Write summary to GitHub Actions summary
                   await core.summary
@@ -2392,12 +2330,14 @@ ${issueSafeFallbackFooter}`;
             // Push the branch with an empty commit to allow PR creation
             try {
               // Create an empty commit to ensure there's a commit difference
-              await exec.exec(`git commit --allow-empty -m "Initialize"`);
+              await exec.exec("git", ["commit", "--allow-empty", "-m", "Initialize"]);
               core.info("Created empty commit");
 
               const forkCwd = process.cwd();
               const runEmptyPush = async () => {
+                transport.assertUnchanged();
                 branchName = await handleRemoteBranchCollision(branchName, preserveBranchName, {
+                  assertTransportUnchanged: transport.assertUnchanged,
                   recreateRef,
                   githubClient: pushGithubClient,
                   owner: pushRepoParts.owner,
@@ -2407,7 +2347,9 @@ ${issueSafeFallbackFooter}`;
                   cwd: forkCwd,
                 });
 
+                transport.assertUnchanged();
                 await pushSignedCommits({
+                  assertTransportUnchanged: transport.assertUnchanged,
                   githubClient: pushGithubClient,
                   owner: pushRepoParts.owner,
                   repo: pushRepoParts.repo,
@@ -2435,6 +2377,7 @@ ${issueSafeFallbackFooter}`;
                 core.info("Could not count new commits - extra empty commit will be skipped");
               }
             } catch (pushError) {
+              transport.assertUnchanged();
               const error = `Failed to push empty branch: ${getErrorMessage(pushError)}`;
               core.error(error);
               return {
@@ -2512,7 +2455,8 @@ ${issueSafeFallbackFooter}`;
         }
 
         try {
-          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
+          transport.assertUnchanged();
+          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees, transport.assertUnchanged);
 
           core.info(`Created protected-file-protection review issue #${issue.number}: ${issue.html_url}`);
 
@@ -2539,7 +2483,7 @@ ${issueSafeFallbackFooter}`;
 
           await assignCopilotToFallbackIssueIfEnabled(issueRepoParts.owner, issueRepoParts.repo, issue.number);
 
-          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue", { activationCommentLinks });
 
           return {
             success: true,
@@ -2562,7 +2506,10 @@ ${issueSafeFallbackFooter}`;
         if (body.length > MAX_GITHUB_BODY_LENGTH) {
           throw new Error(`Pull request body exceeds GitHub's maximum length of ${MAX_GITHUB_BODY_LENGTH} characters`);
         }
+        transport.assertUnchanged();
+        const preparedDelivery = await preparePullRequestDelivery(exec, baseBranch, defaultBaseBranch);
         const { data: pullRequest } = await createOrUpdatePullRequest({
+          assertTransportUnchanged: transport.assertUnchanged,
           githubClient,
           repoParts,
           title,
@@ -2746,7 +2693,7 @@ ${issueSafeFallbackFooter}`;
         //
         // NOTE: we pass 'github' (global octokit) instead of githubClient (repo-scoped octokit) because the issue is created
         // in the same repo as the activation, so the global client has the correct context for updating the comment.
-        await updateActivationComment(github, context, core, pullRequest.html_url, pullRequest.number);
+        await updateActivationComment(github, context, core, pullRequest.html_url, pullRequest.number, "pull_request", { activationCommentLinks });
 
         // Close older pull requests if enabled (best-effort: errors are logged but do not fail the workflow)
         if (closeOlderPullRequestsEnabled) {
@@ -2784,7 +2731,9 @@ ${issueSafeFallbackFooter}`;
         // This works around the GITHUB_TOKEN limitation where pushes don't trigger CI events.
         // Restricting to exactly 1 new commit prevents the CI trigger token being used on
         // multi-commit branches where workflow files may have been iteratively modified.
+        transport.assertUnchanged();
         const ciTriggerResult = await pushExtraEmptyCommit({
+          assertTransportUnchanged: transport.assertUnchanged,
           branchName,
           repoOwner: pushRepoParts.owner,
           repoName: pushRepoParts.repo,
@@ -2795,19 +2744,40 @@ ${issueSafeFallbackFooter}`;
         }
 
         // Return success with PR details
-        return {
-          success: true,
-          number: pullRequest.number,
-          url: pullRequest.html_url,
-          id: pullRequest.id,
-          metadata: { node_id: pullRequest.node_id },
-          managedBody: body,
-          branch_name: branchName,
-          temporaryId: temporaryId,
-          repo: itemRepo,
-          head_repo: pushRepo,
-        };
+        return await capturePullRequestDelivery(
+          {
+            success: true,
+            number: pullRequest.number,
+            url: pullRequest.html_url,
+            id: pullRequest.id,
+            metadata: { node_id: pullRequest.node_id },
+            managedBody: body,
+            branch_name: branchName,
+            temporaryId: temporaryId,
+            repo: itemRepo,
+            head_repo: pushRepo,
+          },
+          message,
+          {
+            prepared: preparedDelivery,
+            id: String(pullRequest.id),
+            number: pullRequest.number,
+            url: pullRequest.html_url,
+            repository: itemRepo,
+            headRepository: pushRepo,
+            branch: branchName,
+            baseBranch,
+            transportBaseBranch: defaultBaseBranch,
+            title,
+            body,
+            draft,
+            labels,
+            assignees: configAssignees || [],
+          },
+          githubClient
+        );
       } catch (prError) {
+        transport.assertUnchanged();
         const errorMessage = getErrorMessage(prError);
         core.warning(`Failed to create pull request: ${errorMessage}`);
 
@@ -2827,7 +2797,7 @@ ${issueSafeFallbackFooter}`;
           if (patchFilePath && fs.existsSync(patchFilePath)) {
             let patchContent;
             try {
-              patchContent = fs.readFileSync(patchFilePath, "utf8");
+              patchContent = transport.read(patchFilePath).toString("utf8");
             } catch (err) {
               throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
             }
@@ -2845,12 +2815,13 @@ ${issueSafeFallbackFooter}`;
           });
 
           try {
-            const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
+            transport.assertUnchanged();
+            const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees, transport.assertUnchanged);
 
             core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
             await assignCopilotToFallbackIssueIfEnabled(issueRepoParts.owner, issueRepoParts.repo, issue.number);
 
-            await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+            await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue", { activationCommentLinks });
 
             return {
               success: true,
@@ -2893,7 +2864,7 @@ ${issueSafeFallbackFooter}`;
         if (patchFilePath && fs.existsSync(patchFilePath)) {
           let patchContent;
           try {
-            patchContent = fs.readFileSync(patchFilePath, "utf8");
+            patchContent = transport.read(patchFilePath).toString("utf8");
           } catch (err) {
             throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
           }
@@ -2919,7 +2890,8 @@ ${patchPreview}
 ${issueSafeFallbackFooter}`;
 
         try {
-          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
+          transport.assertUnchanged();
+          const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees, transport.assertUnchanged);
 
           core.info(`Created fallback issue #${issue.number}: ${issue.html_url}`);
           await assignCopilotToFallbackIssueIfEnabled(issueRepoParts.owner, issueRepoParts.repo, issue.number);
@@ -2927,7 +2899,7 @@ ${issueSafeFallbackFooter}`;
           // Update the activation comment with issue link (if a comment was created)
           // NOTE: we pass 'github' (global octokit) instead of githubClient (repo-scoped octokit) because the issue is created
           // in the same repo as the activation, so the global client has the correct context for updating the comment.
-          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue");
+          await updateActivationComment(github, context, core, issue.html_url, issue.number, "issue", { activationCommentLinks });
 
           // Return success with fallback flag
           return {
@@ -2954,7 +2926,7 @@ ${issueSafeFallbackFooter}`;
         process.chdir(originalCwd);
       }
     }
-  }; // End of handleCreatePullRequest
+  }); // End of handleCreatePullRequest
 } // End of main
 
 module.exports = {

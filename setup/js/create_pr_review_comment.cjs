@@ -12,10 +12,11 @@ const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { getBodyFooterMessage } = require("./messages_footer.cjs");
 const { isTemplatableTrue, isStagedMode, logStagedPreviewInfo, checkRequiredFilter } = require("./safe_output_helpers.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
 const { parseIntTemplatable } = require("./templatable.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { fitMarkdownBody } = require("./report_size.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "create_pull_request_review_comment";
@@ -61,11 +62,11 @@ async function main(config = {}) {
   if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
 
   const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
-  let allowedMentionAliases = [];
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   if (!registry && !legacyBuffer) {
@@ -169,6 +170,7 @@ async function main(config = {}) {
       };
     }
     const { repo: itemRepo, repoParts } = repoResult;
+    const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
     core.info(`Target repository: ${itemRepo}`);
 
     // Check if we're in a pull request context, or an issue comment context on a PR
@@ -378,14 +380,13 @@ async function main(config = {}) {
     // Buffer the comment instead of posting it individually
     let body = sanitizeContent(commentItem.body.trim(), { allowedAliases: allowedMentionAliases, maxMentions });
     const bodyFooter = getBodyFooterMessage(config.body_footer, { workflowName, runUrl });
-    if (bodyFooter) {
-      body += "\n\n" + bodyFooter.trimEnd();
-    }
+    body = fitMarkdownBody(body, { suffix: bodyFooter ? "\n\n" + bodyFooter.trimEnd() : "", allowedMentions: allowedMentionAliases });
     /** @type {import('./pr_review_buffer.cjs').BufferedComment} */
     const bufferedComment = {
       path: commentItem.path,
       line: line,
       body,
+      ...(bodyFooter ? { bodyFooter: "\n\n" + bodyFooter.trimEnd() } : {}),
       side: side,
     };
 

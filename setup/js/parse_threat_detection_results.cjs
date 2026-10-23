@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 /**
  * Parse Threat Detection Results
  *
@@ -165,8 +166,15 @@ function extractFromStreamJson(line) {
   // Assumes the first JSON object on the line is the event payload.
   const jsonStart = trimmed.indexOf("{");
   if (jsonStart === -1) return null;
-  const jsonText = trimmed.slice(jsonStart);
+  const event = iterateJsonlEvents(trimmed.slice(jsonStart)).next().value;
+  return event?.type === "json" ? extractFromStreamRecord(event.value) : null;
+}
 
+/**
+ * @param {any} obj Already decoded stream record.
+ * @returns {string|null}
+ */
+function extractFromStreamRecord(obj) {
   /**
    * @param {string} text
    * @returns {string|null}
@@ -196,7 +204,6 @@ function extractFromStreamJson(line) {
   }
 
   try {
-    const obj = JSON.parse(jsonText);
     // Only extract from the authoritative "result" summary, not "assistant" messages.
     // In stream-json mode, the same content appears in both; using only "result"
     // avoids double-counting.
@@ -292,11 +299,18 @@ function parseDetectionLog(content) {
 
   // Phase 1: Try stream-json extraction (from "type":"result" lines only)
   const streamMatches = [];
-  for (const line of lines) {
-    const extracted = extractFromStreamJson(line);
+  const assistantChunks = [];
+  for (const event of iterateJsonlEvents(content, {
+    lineFilter: line => line.includes("{"),
+    lineTransform: line => line.slice(line.indexOf("{")),
+  })) {
+    if (event.type === "invalid") continue;
+    const extracted = extractFromStreamRecord(event.value);
     if (extracted) {
       streamMatches.push(extracted);
     }
+    const obj = event.value;
+    if (event.rawLine.trim().startsWith("{") && obj.type === "message" && obj.role === "assistant" && typeof obj.content === "string") assistantChunks.push(obj.content);
   }
 
   // Phase 2: If no stream-json result field matches, try assistant stream chunk matching.
@@ -307,20 +321,6 @@ function parseDetectionLog(content) {
   // Reassemble assistant chunks and parse the first complete verdict object.
   const assistantMatches = [];
   if (streamMatches.length === 0) {
-    const assistantChunks = [];
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("{")) continue;
-      try {
-        const obj = JSON.parse(trimmed);
-        if (obj.type === "message" && obj.role === "assistant" && typeof obj.content === "string") {
-          assistantChunks.push(obj.content);
-        }
-      } catch {
-        // Not valid JSON — ignore
-      }
-    }
-
     if (assistantChunks.length > 0) {
       const combinedAssistantText = assistantChunks.join("");
       const prefixIdx = combinedAssistantText.indexOf(RESULT_PREFIX);
@@ -520,8 +520,10 @@ async function main() {
 
   /**
    * Helper to set detection failure/warning outputs based on continue-on-error mode.
-   * In warn mode, engine failures with tooling reasons fail closed; all other
-   * failures set conclusion=warning, success=false, and do not fail the job.
+   * In warn mode every failure (including detection engine failures with the
+   * tooling reasons agent_failure/parse_error) sets conclusion=warning,
+   * success=false, and does not fail the job, so safe outputs get the warn-mode
+   * policy (WTD1/WTD1a annotation, WTD2 conversion, WTD3 abort).
    * In error mode: sets conclusion=failure, success=false, fails the job.
    * @param {string} reason - Categorized reason (e.g. "threat_detected", "agent_failure", "parse_error")
    * @param {string} message - Human-readable error message
@@ -532,8 +534,7 @@ async function main() {
     }
     core.setOutput("reason", reason);
     core.exportVariable("GH_AW_DETECTION_REASON", reason);
-    const mustFail = detectionExecutionOutcome === "failure" && (reason === "agent_failure" || reason === "parse_error");
-    if (isWarnMode && !mustFail) {
+    if (isWarnMode) {
       core.warning(`⚠️ ${message}`);
       core.setOutput("conclusion", "warning");
       core.exportVariable("GH_AW_DETECTION_CONCLUSION", "warning");

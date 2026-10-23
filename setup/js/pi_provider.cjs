@@ -23,6 +23,10 @@
  *                    or bare "model". Preferred over PI_MODEL so gh-aw can pass
  *                    model context to extensions without changing Pi CLI behavior.
  *   PI_MODEL         Legacy fallback used when GH_AW_PI_MODEL is not set.
+ *   GH_AW_PI_SUBAGENT_CHILD / GH_AW_PI_SUBAGENT_NAME
+ *                    Set by pi_subagent_extension.cjs in a sub-agent process. Each
+ *                    Pi process sends its own AWF caller declaration
+ *                    (x-awf-caller: main or subagent/<name>) on provider requests.
  */
 
 "use strict";
@@ -31,6 +35,7 @@ const { fetchAWFReflect, AWF_API_PROXY_REFLECT_URL, AWF_REFLECT_OUTPUT_PATH, AWF
 const { emitInfrastructureIncomplete } = require("./safeoutputs_cli.cjs");
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { getProviderErrorDetails } = require("./pi_provider_error.cjs");
 
 // Default logger: prefixed with "[gh-aw/pi-provider]" for easy grepping.
 // prettier-ignore
@@ -83,6 +88,42 @@ function resolveGatewayUrl(provider) {
   const port = GATEWAY_PORTS[provider];
   if (!port) return null;
   return `http://api-proxy:${port}`;
+}
+
+const AWF_CALLER_HEADER = "x-awf-caller";
+const AWF_CALLER_MAX_LENGTH = 128;
+const AWF_CALLER_PATTERN = /^(?:main|subagent\/[A-Za-z0-9_.:/-]+)$/;
+
+/**
+ * Resolve this Pi process's AWF caller declaration. The parent process is the
+ * main agent; a sub-agent process (launched by pi_subagent_extension.cjs with
+ * its own environment) declares its agent definition name. Returns null when
+ * the value would be invalid, so the request is sent without the header rather
+ * than with a truncated or misleading caller.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string|null}
+ */
+function resolveAwfCaller(env = process.env) {
+  if (env.GH_AW_PI_SUBAGENT_CHILD !== "1") return "main";
+  const caller = `subagent/${env.GH_AW_PI_SUBAGENT_NAME || ""}`;
+  return caller.length <= AWF_CALLER_MAX_LENGTH && AWF_CALLER_PATTERN.test(caller) ? caller : null;
+}
+
+/**
+ * Set the AWF caller header on mutable Pi provider headers, replacing any
+ * differently cased copy so exactly one value is sent.
+ *
+ * @param {Record<string, string|null>|undefined|null} headers
+ * @param {string|null} caller
+ * @returns {void}
+ */
+function applyAwfCallerHeader(headers, caller) {
+  if (!headers || typeof headers !== "object") return;
+  for (const name of Object.keys(headers)) {
+    if (name.toLowerCase() === AWF_CALLER_HEADER) delete headers[name];
+  }
+  if (caller) headers[AWF_CALLER_HEADER] = caller;
 }
 
 /**
@@ -253,7 +294,7 @@ function registerConfiguredProviders(pi, logger) {
       ["anthropic"],
       {
         apiKey: process.env.ANTHROPIC_API_KEY,
-        api: "anthropic",
+        api: "anthropic-messages",
         ...(process.env.ANTHROPIC_BASE_URL ? { baseUrl: process.env.ANTHROPIC_BASE_URL } : {}),
       },
       logger
@@ -291,12 +332,12 @@ function registerConfiguredProviders(pi, logger) {
 /**
  * Pi provider extension for gh-aw.
  *
- * Registers providers immediately, then subscribes to the `agent_start` and `agent_end`
+ * Registers providers immediately, then subscribes to the `agent_start` and `agent_settled`
  * Pi SDK events and calls the AWF /reflect endpoint to discover and log the open LLM
  * inference paths before the agent begins its first turn and again after it finishes.
  * The post-run fetch is the authoritative snapshot used by the step summary; the pre-run
  * fetch captures the initial proxy state for diagnostics in case the session exits
- * unexpectedly before reaching `agent_end`.
+ * unexpectedly before reaching `agent_settled`.
  * Both calls are best-effort: any network or parse error is logged but does not abort the
  * agent session.
  *
@@ -309,9 +350,21 @@ function piProviderExtension(pi) {
   let lastProviderRequest = null;
   /** @type {{ status: number, responseHeaders: string, succeeded: boolean }|null} */
   let lastProviderResponse = null;
+  /** @type {{ status?: number, message: string }|null} */
+  let lastProviderFailure = null;
   let providerRequestCount = 0;
   let successfulProviderResponseCount = 0;
   registerConfiguredProviders(pi, log);
+
+  // Process isolation is the attribution boundary: the parent and every
+  // sub-agent run as separate Pi processes that each load this extension.
+  // Only send the header to the AWF api-proxy, never directly to a provider
+  // (e.g. sandbox.agent: false — no api-proxy running).
+  if (process.env.AWF_REFLECT_ENABLED === "1") {
+    const awfCaller = resolveAwfCaller();
+    if (!awfCaller) log("x-awf-caller omitted: sub-agent name is not a valid AWF caller");
+    pi.on("before_provider_headers", event => applyAwfCallerHeader(event?.headers, awfCaller));
+  }
 
   pi.on("before_provider_request", (_event, ctx) => {
     providerRequestCount += 1;
@@ -333,6 +386,10 @@ function piProviderExtension(pi) {
       responseHeaders: formatResponseHeaderNames(event.headers),
       succeeded,
     };
+    if (!succeeded) {
+      const responseBody = event.body ?? event.responseBody;
+      lastProviderFailure = getProviderErrorDetails(responseBody, event.status);
+    }
     const provider = ctx?.model?.provider || "(unknown provider)";
     const model = ctx?.model?.id || getConfiguredModel() || "(unknown model)";
     log(`provider_response provider=${provider} model=${model} status=${event.status} method=${request.method} url=${request.url} response_headers=${lastProviderResponse.responseHeaders}`);
@@ -344,10 +401,11 @@ function piProviderExtension(pi) {
       return;
     }
     const request = lastProviderRequest || { api: message.api || "(unknown api)", method: "POST", url: "(request unavailable)" };
-    const status = lastProviderResponse ? String(lastProviderResponse.status) : "no-response";
+    lastProviderFailure = getProviderErrorDetails(message.errorMessage, lastProviderResponse?.status);
+    const status = typeof lastProviderFailure.status === "number" ? String(lastProviderFailure.status) : "no-response";
     const responseHeaders = lastProviderResponse ? lastProviderResponse.responseHeaders : "none";
     log(
-      `provider_error provider=${message.provider || "(unknown provider)"} model=${message.model || "(unknown model)"} api=${request.api} status=${status} method=${request.method} url=${request.url} response_headers=${responseHeaders} error=${JSON.stringify(message.errorMessage)}`
+      `provider_error provider=${message.provider || "(unknown provider)"} model=${message.model || "(unknown model)"} api=${request.api} status=${status} method=${request.method} url=${request.url} response_headers=${responseHeaders} error=${JSON.stringify(lastProviderFailure.message)}`
     );
     if (lastProviderResponse?.succeeded) {
       successfulProviderResponseCount -= 1;
@@ -385,7 +443,7 @@ function piProviderExtension(pi) {
     }
   });
 
-  pi.on("agent_end", async () => {
+  pi.on("agent_settled", async () => {
     // Fetch AWF API proxy reflection data after the agent finishes for the post-run step summary.
     // This is best-effort: failures are logged but do not affect the agent exit code.
     // Skip when AWF_REFLECT_ENABLED is not "1" (e.g. sandbox.agent: false — no api-proxy running).
@@ -399,11 +457,14 @@ function piProviderExtension(pi) {
         modelsTimeoutMs: AWF_MODELS_URL_TIMEOUT_MS,
         logger: log,
       });
-      logReflectFailure({ phase: "agent_end", provider, model, result, logger: log });
+      logReflectFailure({ phase: "agent_settled", provider, model, result, logger: log });
     }
 
     if (providerRequestCount > 0 && successfulProviderResponseCount === 0) {
-      emitInfrastructureIncompleteIfNoSafeOutputs(`All ${providerRequestCount} Pi provider requests failed before safe outputs were emitted.`, log);
+      const providerFailureDetails = lastProviderFailure
+        ? ` Last provider failure: ${typeof lastProviderFailure.status === "number" ? `HTTP ${lastProviderFailure.status}; ` : ""}message=${JSON.stringify(lastProviderFailure.message)}.`
+        : "";
+      emitInfrastructureIncompleteIfNoSafeOutputs(`All ${providerRequestCount} Pi provider requests failed before safe outputs were emitted.${providerFailureDetails}`, log);
       process.exitCode = 1;
     }
   });
@@ -420,3 +481,5 @@ _piExports.resolveProviderRequestTarget = resolveProviderRequestTarget;
 _piExports.formatResponseHeaderNames = formatResponseHeaderNames;
 _piExports.emitInfrastructureIncompleteIfNoSafeOutputs = emitInfrastructureIncompleteIfNoSafeOutputs;
 _piExports.logReflectFailure = logReflectFailure;
+_piExports.resolveAwfCaller = resolveAwfCaller;
+_piExports.applyAwfCallerHeader = applyAwfCallerHeader;

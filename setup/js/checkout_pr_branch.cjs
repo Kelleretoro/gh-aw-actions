@@ -7,8 +7,8 @@
  * This script handles checkout for different GitHub event types:
  *
  * 1. pull_request: Runs in merge commit context (PR head + base merged)
- *    - Can use direct git commands since we're already in PR context
- *    - Branch exists in current checkout
+ *    - Uses refs/pull/N/head even for same-repository PRs
+ *    - The retained PR ref survives head branch deletion after merge
  *
  * 2. pull_request_target: Runs in BASE repository context (not PR head)
  *    - CRITICAL: For fork PRs, the head branch doesn't exist in base repo
@@ -31,14 +31,40 @@
  */
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { redactAndBoundDiagnostics } = require("./diagnostic_sanitization.cjs");
 const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 const { detectForkPR } = require("./pr_helpers.cjs");
+const { parseAllowedBots, isAllowedBot, canonicalizeBotIdentifier } = require("./check_permissions_utils.cjs");
 const { ERR_API, ERR_PERMISSION } = require("./error_codes.cjs");
 const TRUSTED_CHECKOUT_PERMISSIONS = ["write", "maintain", "admin"];
+const TRUSTED_BOT_PR_ACTIONS = ["opened", "synchronize", "ready_for_review", "reopened"];
 // Centralized command/label routing uses the repository GITHUB_TOKEN, whose
 // GitHub-authenticated actor is fixed to this platform identity.
 const CENTRALIZED_ROUTER_ACTOR = "github-actions[bot]";
 const PR_HEAD_BASE_REF = "refs/remotes/origin/pr-head";
+
+/** @param {string} text */
+function redactCheckoutDiagnostics(text) {
+  const redactCredentials = value => value.replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@").replace(/(authorization:\s*(?:bearer|basic)\s+)\S+/gi, "$1[REDACTED]");
+  return redactCredentials(redactAndBoundDiagnostics(redactCredentials(text), { maskedValues: [process.env.GITHUB_TOKEN, process.env.GH_TOKEN].flatMap(value => (value ? [value] : [])) }));
+}
+
+class PRHeadFetchError extends Error {
+  /** @param {number} exitCode @param {string} stderr */
+  constructor(exitCode, stderr) {
+    super(`git fetch failed with exit code ${exitCode}${stderr.trim() ? `: ${redactCheckoutDiagnostics(stderr.trim())}` : ""}`);
+    this.missingRef = /could(?:n't| not) find remote ref|remote ref does not exist/i.test(stderr);
+  }
+}
+
+/** @param {string[]} args */
+async function fetchPRHead(args) {
+  // @actions/exec rejects with only the exit code, not git's stderr.
+  const { exitCode, stderr } = await exec.getExecOutput("git", ["fetch", "origin", ...args], { silent: true, ignoreReturnCode: true });
+  if (exitCode !== 0) {
+    throw new PRHeadFetchError(exitCode, stderr);
+  }
+}
 
 /**
  * Resolve the commit SHA actually checked out at HEAD.
@@ -235,10 +261,11 @@ function parsePullRequestNumber(value) {
 /**
  * Ensure checkout step only runs in trusted runtime contexts.
  * - workflow_dispatch PR replay must not run in a forked repository
- * - triggering actor must have write-or-higher repository permission
+ * - triggering actor must have write-or-higher repository permission, or be
+ *   the bot sender of a same-repository PR event
  * @param {Record<string, any> | undefined} awContext Parsed workflow_dispatch context, consulted only for github-actions bot dispatches
  */
-async function assertTrustedCheckoutRuntime(awContext) {
+async function assertTrustedCheckoutRuntime(awContext, pullRequest) {
   if (context.eventName === "workflow_dispatch") {
     const repository = context.payload.repository;
     // Fork status can only be verified when the payload carries repository
@@ -287,10 +314,48 @@ async function assertTrustedCheckoutRuntime(awContext) {
     throw new Error(`${ERR_PERMISSION}: ` + "Refusing PR checkout: unable to determine triggering actor");
   }
 
-  // Bot and app actors (e.g. Copilot, dependabot[bot]) use GitHub-provided
-  // event identity (`sender.type === "Bot"`), but that signal only proves the
-  // account type. They still must satisfy the same repository permission floor
-  // below; the workflow_dispatch-only fork check above is independent.
+  // Apps are not collaborators: their permission endpoint returns "none" even
+  // when they can write to the repository. A bot that triggered a PR event for
+  // a branch in this repository can have its checkout trusted instead. Other
+  // events require the collaborator check unless explicitly allow-listed below.
+  if (
+    (context.eventName === "pull_request" || context.eventName === "pull_request_target") &&
+    typeof context.payload.action === "string" &&
+    TRUSTED_BOT_PR_ACTIONS.includes(context.payload.action) &&
+    senderType === "Bot" &&
+    context.payload.sender?.login === actor &&
+    context.payload.repository !== undefined &&
+    context.payload.repository !== null &&
+    Number.isSafeInteger(context.payload.repository.id) &&
+    context.payload.repository.id > 0 &&
+    pullRequest?.head?.repo?.id === context.payload.repository.id &&
+    pullRequest?.base?.repo?.id === context.payload.repository.id
+  ) {
+    core.info(`Runtime safety check passed for same-repository bot PR actor '${actor}'`);
+    return undefined;
+  }
+
+  const runtimeRepositoryId = context.payload.repository?.id;
+  const senderLogin = context.payload.sender?.login;
+  const isReview = context.eventName === "pull_request_review";
+  if (
+    (context.eventName === "issue_comment" || context.eventName === "pull_request_review_comment" || isReview) &&
+    senderType === "Bot" &&
+    typeof senderLogin === "string" &&
+    (isReview ? context.payload.review?.user?.login : context.payload.comment?.user?.login) === senderLogin &&
+    canonicalizeBotIdentifier(senderLogin) === canonicalizeBotIdentifier(actor) &&
+    isAllowedBot(actor, parseAllowedBots()) &&
+    Number.isSafeInteger(runtimeRepositoryId) &&
+    runtimeRepositoryId > 0
+  ) {
+    const details = await fetchPRDetails(pullRequest.number);
+    if (details.pullRequest.head?.repo?.id === runtimeRepositoryId && details.pullRequest.base?.repo?.id === runtimeRepositoryId) {
+      core.info(`Runtime safety check passed for same-repository allowed bot ${isReview ? "review" : "comment"} actor '${actor}'`);
+      return details;
+    }
+  }
+
+  // All other actors must satisfy the collaborator permission floor.
   try {
     const { data: permissionData } = await github.rest.repos.getCollaboratorPermissionLevel({
       owner: context.repo.owner,
@@ -325,6 +390,7 @@ async function assertTrustedCheckoutRuntime(awContext) {
     }
     throw err;
   }
+  return undefined;
 }
 
 async function main() {
@@ -395,30 +461,28 @@ async function main() {
   }
 
   try {
-    await assertTrustedCheckoutRuntime(workflowDispatchAwContext);
+    const trustedPRDetails = await assertTrustedCheckoutRuntime(workflowDispatchAwContext, pullRequest);
 
     // Log detailed context for debugging
     const { isFork } = logPRContext(eventName, pullRequest);
 
-    if (eventName === "pull_request" && isFork === false) {
-      // For non-fork pull_request events, we run in the merge commit context.
-      // The PR branch is in the same repo as origin, so we can use direct git commands.
-      // Fork PRs cannot use git fetch because their head branch only exists in the fork
-      // (not in origin/base repo), so they must use gh pr checkout in the else branch below.
+    if (eventName === "pull_request" && isFork === false && !isClosed) {
+      // Use the retained PR head ref, not the branch name: the PR may have
+      // merged and its branch disappeared since the webhook was captured.
       const branchName = pullRequest.head.ref;
       // commits is in the payload for pull_request events; +1 to include the merge base
       const commitCount = pullRequest.commits || 1;
       const fetchDepth = commitCount + 1;
 
-      logCheckoutStrategy(eventName, "git fetch + checkout", "pull_request event runs in merge commit context with PR branch available");
+      logCheckoutStrategy(eventName, "git fetch refs/pull + checkout", "same-repository pull_request event; retained PR head ref survives branch deletion");
 
-      core.info(`Fetching branch: ${branchName} from origin (depth: ${fetchDepth} for ${commitCount} PR commit(s))`);
+      core.info(`Fetching PR #${pullRequest.number} head via refs/pull/${pullRequest.number}/head (depth: ${fetchDepth} for ${commitCount} PR commit(s))`);
       const fetchArgs = await depthArgs(fetchDepth);
       core.info(fetchArgs.length > 0 ? `Fetching with ${fetchArgs.join(" ")}` : "Fetching without --depth (full history preserved)");
-      await exec.exec("git", ["fetch", "origin", branchName, ...fetchArgs]);
+      await fetchPRHead([`+refs/pull/${pullRequest.number}/head:${PR_HEAD_BASE_REF}`, ...fetchArgs]);
 
       core.info(`Checking out branch: ${branchName}`);
-      await exec.exec("git", ["checkout", branchName]);
+      await exec.exec("git", ["checkout", "-B", branchName, PR_HEAD_BASE_REF]);
 
       await exportPRHeadBaseline({
         branchName,
@@ -437,7 +501,7 @@ async function main() {
       // Get PR details from API to determine head ref name and commit count.
       // This also gives us the full PR object for accurate fork detection
       // when the event payload only had a minimal PR (e.g. issue_comment).
-      const { commitCount, headRef, pullRequest: fullPR } = await fetchPRDetails(prNumber);
+      const { commitCount, headRef, pullRequest: fullPR } = trustedPRDetails || (await fetchPRDetails(prNumber));
 
       // Re-evaluate fork status with full PR data when it was unknown
       const fullPRForkDetection = detectForkPR(fullPR);
@@ -463,11 +527,11 @@ async function main() {
       core.info(`Fetching PR #${prNumber} head via refs/pull/${prNumber}/head (depth: ${fetchDepth} for ${commitCount} PR commit(s))`);
       const prFetchArgs = await depthArgs(fetchDepth);
       core.info(prFetchArgs.length > 0 ? `Fetching with ${prFetchArgs.join(" ")}` : "Fetching without --depth (full history preserved)");
-      await exec.exec("git", ["fetch", "origin", `+refs/pull/${prNumber}/head:${PR_HEAD_BASE_REF}`, ...prFetchArgs]);
+      await fetchPRHead([`+refs/pull/${prNumber}/head:${PR_HEAD_BASE_REF}`, ...prFetchArgs]);
 
       const branchName = headRef || `pr-${prNumber}`;
       core.info(`Checking out branch: ${branchName}`);
-      await exec.exec("git", ["checkout", "-B", branchName, "origin/pr-head"]);
+      await exec.exec("git", ["checkout", "-B", branchName, PR_HEAD_BASE_REF]);
 
       await exportPRHeadBaseline({
         branchName,
@@ -482,43 +546,12 @@ async function main() {
     // Set output to indicate successful checkout
     core.setOutput("checkout_pr_success", "true");
   } catch (error) {
-    const errorMsg = getErrorMessage(error);
-
-    // Check if PR is closed - if so, treat checkout failure as a warning
-    if (isClosed) {
-      core.startGroup("⚠️ Closed PR Checkout Warning");
-      core.warning(`Event type: ${eventName}`);
-      core.warning(`PR number: ${pullRequest.number}`);
-      core.warning(`PR state: closed`);
-      core.warning(`Checkout failed (expected for closed PR): ${errorMsg}`);
-
-      if (pullRequest.head?.ref) {
-        core.warning(`Branch likely deleted: ${pullRequest.head.ref}`);
-      }
-
-      core.warning("This is expected behavior when a PR is closed - the branch may have been deleted.");
-      core.endGroup();
-
-      // Set output to indicate successful handling of closed PR
-      core.setOutput("checkout_pr_success", "true");
-
-      // Add a brief summary noting this is expected
-      const warningMessage = `## ⚠️ Closed Pull Request
-
-Pull request #${pullRequest.number} is closed. The checkout failed because the branch has likely been deleted, which is expected behavior.
-
-**This is not an error** - workflows targeting closed PRs will continue normally.`;
-
-      await core.summary.addRaw(warningMessage).write();
-
-      // Do NOT call setFailed - this should not fail the step
-      return;
-    }
+    const errorMsg = redactCheckoutDiagnostics(getErrorMessage(error));
 
     // Re-check current PR state via API to handle race conditions where
     // the PR was merged/closed after the webhook payload was captured but
     // before the agent job ran (e.g. PR merged within seconds of triggering).
-    let isNowClosed = false;
+    let isNowClosed = isClosed;
     try {
       const { data: currentPR } = await github.rest.pulls.get({
         owner: context.repo.owner,
@@ -527,7 +560,7 @@ Pull request #${pullRequest.number} is closed. The checkout failed because the b
       });
       isNowClosed = currentPR.state === "closed";
       if (isNowClosed) {
-        core.info(`ℹ️ PR #${pullRequest.number} is now closed (was '${pullRequest.state}' in webhook payload) — treating checkout failure as expected`);
+        core.info(`PR #${pullRequest.number} is now closed (was '${pullRequest.state}' in webhook payload)`);
       }
     } catch (apiError) {
       const apiErrorMsg = getErrorMessage(apiError);
@@ -536,31 +569,10 @@ Pull request #${pullRequest.number} is closed. The checkout failed because the b
       core.warning(`Could not fetch current PR state${statusSuffix}: ${apiErrorMsg}`);
     }
 
-    if (isNowClosed) {
-      core.startGroup("⚠️ Closed PR Checkout Warning");
-      core.warning(`Event type: ${eventName}`);
-      core.warning(`PR number: ${pullRequest.number}`);
-      core.warning(`PR state: closed (merged after workflow was triggered)`);
-      core.warning(`Checkout failed (expected for closed PR): ${errorMsg}`);
-
-      if (pullRequest.head?.ref) {
-        core.warning(`Branch likely deleted: ${pullRequest.head.ref}`);
-      }
-
-      core.warning("This is expected behavior when a PR is closed - the branch may have been deleted.");
-      core.endGroup();
-
-      // Set output to indicate successful handling of closed PR
-      core.setOutput("checkout_pr_success", "true");
-
-      const warningMessage = `## ⚠️ Closed Pull Request
-
-Pull request #${pullRequest.number} was merged after this workflow was triggered. The checkout failed because the branch has been deleted, which is expected behavior.
-
-**This is not an error** - workflows targeting closed PRs will continue normally.`;
-
-      await core.summary.addRaw(warningMessage).write();
-      return;
+    // Closure alone must not hide permission, authentication, or network errors.
+    if (!isClosed && isNowClosed && error instanceof PRHeadFetchError && error.missingRef) {
+      core.setOutput("checkout_pr_invalidated", "true");
+      core.warning(`PR #${pullRequest.number} closed before its head could be fetched. Stopping rather than running on the previous checkout.`);
     }
 
     // For open PRs, treat checkout failure as an error
@@ -576,16 +588,20 @@ Pull request #${pullRequest.number} was merged after this workflow was triggered
 
     // Log current git state for debugging
     try {
-      core.info("Current git status:");
-      await exec.exec("git", ["status"]);
-
-      core.info("Available remotes:");
-      await exec.exec("git", ["remote", "-v"]);
-
-      core.info("Current branch:");
-      await exec.exec("git", ["branch", "--show-current"]);
+      /** @type {[string, string[]][]} */
+      const diagnostics = [
+        ["Current git status:", ["status"]],
+        ["Available remotes:", ["remote", "-v"]],
+        ["Current branch:", ["branch", "--show-current"]],
+      ];
+      for (const [label, args] of diagnostics) {
+        core.info(label);
+        const { stdout, stderr } = await exec.getExecOutput("git", args, { silent: true });
+        if (stdout) core.info(redactCheckoutDiagnostics(stdout));
+        if (stderr) core.warning(redactCheckoutDiagnostics(stderr));
+      }
     } catch (gitError) {
-      core.warning(`Could not retrieve git state: ${getErrorMessage(gitError)}`);
+      core.warning(`Could not retrieve git state: ${redactCheckoutDiagnostics(getErrorMessage(gitError))}`);
     }
 
     core.endGroup();

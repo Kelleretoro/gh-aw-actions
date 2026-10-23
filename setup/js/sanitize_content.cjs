@@ -24,7 +24,7 @@ const {
   neutralizeBotTriggers,
   neutralizeTemplateDelimiters,
   applyTruncation,
-  hardenUnicodeText,
+  canonicalizePublicationText,
 } = require("./sanitize_content_core.cjs");
 
 const { balanceCodeRegions } = require("./markdown_code_region_balancer.cjs");
@@ -38,12 +38,36 @@ const RUNTIME_TO_MENTION_ALIAS_MAP = {
 };
 
 /**
+ * Expand allowlisted runtime aliases into accepted mention aliases.
+ * @param {string[]} aliases
+ * @returns {string[]}
+ */
+function expandAllowedAliases(aliases) {
+  const expanded = new Set();
+  for (const alias of aliases) {
+    if (typeof alias !== "string" || alias.length === 0) {
+      continue;
+    }
+    const normalized = alias.toLowerCase();
+    expanded.add(normalized);
+    const mentionAliases = RUNTIME_TO_MENTION_ALIAS_MAP[normalized];
+    if (Array.isArray(mentionAliases)) {
+      for (const mentionAlias of mentionAliases) {
+        expanded.add(mentionAlias.toLowerCase());
+      }
+    }
+  }
+  return [...expanded];
+}
+
+/**
  * @typedef {Object} SanitizeOptions
  * @property {number} [maxLength] - Maximum length of content (default: 524288)
  * @property {string[]} [allowedAliases] - List of aliases (@mentions) that should not be neutralized
  * @property {number} [maxMentions] - Maximum number of unique allowed aliases to preserve
  * @property {Set<string>} [allowedAliasesSeen] - Allowed aliases already preserved in this output item
  * @property {number} [maxBotMentions] - Maximum bot trigger references before filtering (default: 10)
+ * @property {boolean} [deferMentions] - Preserve mentions for filtering in the trusted safe-outputs job
  */
 
 /**
@@ -62,6 +86,7 @@ function sanitizeContent(content, maxLengthOrOptions) {
   let maxMentions;
   /** @type {number | undefined} */
   let maxBotMentions;
+  let deferMentions = false;
   /** @type {Set<string> | undefined} */
   let allowedAliasesSeen;
 
@@ -74,11 +99,12 @@ function sanitizeContent(content, maxLengthOrOptions) {
     allowedAliasesLowercase = expandAllowedAliases(normalizedAllowedAliases);
     maxMentions = maxLengthOrOptions.maxMentions;
     maxBotMentions = maxLengthOrOptions.maxBotMentions;
+    deferMentions = maxLengthOrOptions.deferMentions === true;
     allowedAliasesSeen = maxLengthOrOptions.allowedAliasesSeen;
   }
 
   // If no allowed aliases specified, use core sanitization (which neutralizes all mentions)
-  if (allowedAliasesLowercase.length === 0) {
+  if (allowedAliasesLowercase.length === 0 && !deferMentions) {
     return sanitizeContentCore(content, maxLength, maxBotMentions);
   }
 
@@ -98,7 +124,7 @@ function sanitizeContent(content, maxLengthOrOptions) {
   let sanitized = content;
 
   // Apply Unicode hardening first to normalize text representation
-  sanitized = hardenUnicodeText(sanitized);
+  sanitized = canonicalizePublicationText(sanitized, { preserveImageAttributes: true });
 
   // Remove ANSI escape sequences and control characters early
   sanitized = sanitized.replace(/\x1b\[[0-9;]*[mGKH]/g, "");
@@ -132,7 +158,9 @@ function sanitizeContent(content, maxLengthOrOptions) {
 
   // Neutralize mentions after truncation so the length boundary cannot split an
   // inserted code-span delimiter and reactivate a mention.
-  sanitized = neutralizeMentions(sanitized, allowedAliasesLowercase, maxMentions, allowedAliasesSeen);
+  if (!deferMentions) {
+    sanitized = neutralizeMentions(sanitized, allowedAliasesLowercase, maxMentions, allowedAliasesSeen);
+  }
 
   // Neutralize GitHub references if restrictions are configured
   sanitized = neutralizeGitHubReferences(sanitized, allowedGitHubRefs);
@@ -167,29 +195,6 @@ function sanitizeContent(content, maxLengthOrOptions) {
   }
 
   /**
-   * Expand allowlisted runtime aliases into accepted mention aliases.
-   * @param {string[]} aliases
-   * @returns {string[]}
-   */
-  function expandAllowedAliases(aliases) {
-    const expanded = new Set();
-    for (const alias of aliases) {
-      if (typeof alias !== "string" || alias.length === 0) {
-        continue;
-      }
-      const normalized = alias.toLowerCase();
-      expanded.add(normalized);
-      const mentionAliases = RUNTIME_TO_MENTION_ALIAS_MAP[normalized];
-      if (Array.isArray(mentionAliases)) {
-        for (const mentionAlias of mentionAliases) {
-          expanded.add(mentionAlias.toLowerCase());
-        }
-      }
-    }
-    return [...expanded];
-  }
-
-  /**
    * Neutralize @mentions with selective filtering
    * @param {string} s - The string to process
    * @param {string[]} allowedLowercase - List of allowed aliases (lowercase)
@@ -220,4 +225,4 @@ function sanitizeContent(content, maxLengthOrOptions) {
   }
 }
 
-module.exports = { sanitizeContent, getRedactedDomains, clearRedactedDomains, writeRedactedDomainsLog };
+module.exports = { sanitizeContent, expandAllowedAliases, getRedactedDomains, clearRedactedDomains, writeRedactedDomainsLog };

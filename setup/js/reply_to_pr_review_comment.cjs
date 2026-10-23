@@ -15,7 +15,8 @@ const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs
 const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
+const { fitMarkdownBody } = require("./report_size.cjs");
 
 /**
  * Type constant for handler identification
@@ -45,11 +46,11 @@ async function main(config = {}) {
   if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
   if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
   const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
-  let allowedMentionAliases = [];
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   // Determine the triggering PR number from context
@@ -125,6 +126,7 @@ async function main(config = {}) {
       }
 
       const { owner, repo } = repoResult.repoParts;
+      const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
 
       // Determine the target PR number
       let targetPRNumber;
@@ -177,19 +179,18 @@ async function main(config = {}) {
       // Inject CAUTION at top of body unconditionally if threat detection warning was raised
       let finalBody = sanitizeContent(body, { allowedAliases: allowedMentionAliases, maxMentions });
       const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
-      if (detectionCaution) {
-        finalBody = detectionCaution + "\n\n" + finalBody;
-      }
+      let suffix = "";
 
       // Append footer with workflow information when enabled
       if (includeFooter) {
         const footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, undefined, triggeringPRNumber, undefined, undefined, { skipDetectionCaution: true });
-        finalBody = finalBody.trimEnd() + "\n\n" + footer;
+        suffix += "\n\n" + footer;
       }
       const bodyFooter = getBodyFooterMessage(config.body_footer, { workflowName, runUrl });
       if (bodyFooter) {
-        finalBody = finalBody.trimEnd() + "\n\n" + bodyFooter.trimEnd();
+        suffix = suffix.trimEnd() + "\n\n" + bodyFooter.trimEnd();
       }
+      finalBody = fitMarkdownBody(includeFooter || bodyFooter ? finalBody.trimEnd() : finalBody, { prefix: detectionCaution ? detectionCaution + "\n\n" : "", suffix, allowedMentions: allowedMentionAliases });
 
       core.info(`Replying to review comment ${numericCommentId} on PR #${targetPRNumber} (${owner}/${repo})`);
 

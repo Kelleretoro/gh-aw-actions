@@ -9,28 +9,68 @@
  */
 
 const { getMessages, renderTemplate, renderTemplateFromFile, toSnakeCase, getPromptPath } = require("./messages_core.cjs");
-const { getMissingInfoSections } = require("./missing_messages_helper.cjs");
+const { getMissingInfoSections, getCollectedMissings, generateMissingInfoReportSections } = require("./missing_messages_helper.cjs");
 const { getBlockedDomains, generateBlockedDomainsSection } = require("./firewall_blocked_domains.cjs");
 const { getDifcFilteredEvents, generateDifcFilteredSection } = require("./gateway_difc_filtered.cjs");
 const { formatCompactInteger } = require("./compact_numbers.cjs");
-const { formatAIC } = require("./model_costs.cjs");
+const { formatEstimatedAIC } = require("./model_costs.cjs");
 const { reduceModelNameToIdentifier } = require("./model_aliases.cjs");
 const { getDetectionWarningMessage } = require("./messages_run_status.cjs");
+const { getEffectiveDetectionConclusion } = require("./threat_detection_warning.cjs");
+const { getEffectiveModelLabel, resolveEffectiveModel, validateModelIdentifier } = require("./model_attribution.cjs");
+const { currentClaimHandle, claimIdentity } = require("./work_queue_claim_scope.cjs");
+const reportAST = require("./report_ast.cjs");
+
+/** @typedef {{type: "quote_line", children: import("./report_ast.cjs").ReportInline[]}} FooterQuoteLine */
+/** @typedef {{type: "diagnostic_sections", markdown: string, buildChildren: () => import("./report_ast.cjs").ReportBlock[]}} FooterDiagnosticSections */
+/** @typedef {string | FooterQuoteLine | FooterDiagnosticSections} FooterPart */
+
+/** @returns {[] | [FooterQuoteLine]} */
+function buildWorkQueueClaimFooter() {
+  const handle = currentClaimHandle();
+  if (!handle) return [];
+  const { work_id, claim_id } = claimIdentity(handle);
+  return [
+    {
+      type: "quote_line",
+      children: [
+        { type: "text", value: "Work " },
+        { type: "code", value: work_id },
+        { type: "text", value: " · Claim " },
+        { type: "code", value: claim_id },
+      ],
+    },
+  ];
+}
+
+/**
+ * Compatibility renderer for string-only, non-issue publishers.
+ * Issue documents consume the parts directly without rendering fragments.
+ * Keep literal templates and legacy diagnostic formatting untouched.
+ * @param {FooterPart[]} parts
+ */
+function renderFooterParts(parts) {
+  const claims = parts.filter(part => typeof part !== "string" && part.type === "quote_line");
+  if (claims.length > 1) throw new TypeError("Footer must contain at most one Claim line");
+  const claim = claims[0];
+  const renderedClaim = claim ? reportAST.renderReport({ type: "report", title: "Footer", children: [{ type: "quote", children: [{ type: "paragraph", children: claim.children }] }] }).body.trimEnd() : "";
+  return parts.map(part => (typeof part === "string" ? part : part.type === "quote_line" ? renderedClaim : part.markdown)).join("");
+}
 
 /**
  * Get the detection caution alert if the detection job found a potential issue.
  * Reads GH_AW_DETECTION_CONCLUSION and GH_AW_DETECTION_REASON from environment variables.
- * Returns the caution alert markdown when conclusion is "warning", or empty string otherwise.
+ * Returns the caution alert markdown when the effective conclusion is "warning" (including a
+ * warn-mode detection engine failure, see getEffectiveDetectionConclusion), or empty string otherwise.
  * @param {string} workflowName - Name of the workflow
  * @param {string} runUrl - URL of the workflow run
  * @returns {string} Caution alert markdown or empty string
  */
 function getDetectionCautionAlert(workflowName, runUrl) {
-  const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION;
-  if (detectionConclusion !== "warning") {
+  const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
+  if (getEffectiveDetectionConclusion(process.env.GH_AW_DETECTION_CONCLUSION, detectionReason) !== "warning") {
     return "";
   }
-  const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
   return getDetectionWarningMessage({ workflowName, runUrl, reason: detectionReason });
 }
 
@@ -81,7 +121,7 @@ function getAmbientContextFromEnv() {
  * @returns {{ value: number|undefined, formatted: string|undefined, suffix: string }}
  */
 function buildAICEntry(label, value, modelAlias) {
-  const formatted = typeof value === "number" ? formatAIC(value) : undefined;
+  const formatted = typeof value === "number" && value > 0 ? formatEstimatedAIC(value) : undefined;
   const prefix = [label, modelAlias].filter(Boolean).join(" ");
   return {
     value,
@@ -114,8 +154,9 @@ function buildAICEntry(label, value, modelAlias) {
  * }}
  */
 function getAICFromEnv() {
-  const aiModel = process.env.GH_AW_PRIMARY_MODEL || process.env.GH_AW_ENGINE_MODEL || undefined;
-  const compressedModelName = reduceModelNameToIdentifier(aiModel);
+  const attribution = resolveEffectiveModel();
+  const aiModel = attribution.model || undefined;
+  const compressedModelName = getEffectiveModelLabel();
   const agenticEngine = process.env.GH_AW_ENGINE_ID || undefined;
   const agentModelIdentifier = [agenticEngine, compressedModelName].filter(Boolean).join(" · ");
   const totalAIC = parsePositiveAIC(process.env.GH_AW_AIC);
@@ -128,7 +169,7 @@ function getAICFromEnv() {
   const threatDetectionEntry = buildAICEntry("⌖", threatDetectionAIC);
   const useBreakdown = threatDetectionEntry.suffix.length > 0 || evalsEntry.suffix.length > 0;
   const aiCredits = useBreakdown ? (agentAIC || 0) + (threatDetectionAIC || 0) + (evalsAIC || 0) : typeof totalAIC === "number" ? totalAIC : agentAIC;
-  const aiCreditsFormatted = typeof aiCredits === "number" ? formatAIC(aiCredits) : undefined;
+  const aiCreditsFormatted = typeof aiCredits === "number" ? formatEstimatedAIC(aiCredits) : undefined;
   const aiCreditsSuffix = useBreakdown ? `${agentEntry.suffix}${threatDetectionEntry.suffix}${evalsEntry.suffix}` : buildAICEntry("", aiCredits, agentModelIdentifier).suffix;
 
   return {
@@ -176,6 +217,15 @@ function getAICFromEnv() {
  * @returns {string} Footer message
  */
 function getFooterMessage(ctx) {
+  return renderFooterParts(getFooterMessageParts(ctx));
+}
+
+/**
+ * Keep programmatic attribution as nodes until the complete document is rendered.
+ * @param {FooterContext} ctx
+ * @returns {FooterPart[]}
+ */
+function getFooterMessageParts(ctx) {
   const messages = getMessages();
 
   const {
@@ -214,7 +264,7 @@ function getFooterMessage(ctx) {
   let aiCreditsFormatted = envAICFormatted;
   let aiCreditsSuffix = envAICSuffix;
   if (hasExplicitContextAIC) {
-    aiCreditsFormatted = explicitContextAIC ? formatAIC(explicitContextAIC) : undefined;
+    aiCreditsFormatted = explicitContextAIC ? formatEstimatedAIC(explicitContextAIC) : undefined;
     aiCreditsSuffix = buildAICEntry("", explicitContextAIC, agentModelIdentifier).suffix;
   }
   const aiCreditsSuffixForTemplate = `${aiCreditsSuffix}${envAmbientContextSuffix}`;
@@ -246,7 +296,7 @@ function getFooterMessage(ctx) {
     threatDetectionAiCreditsSuffix,
   });
 
-  const getRunAgainHints = renderedFooter => {
+  const getFooterHints = renderedFooter => {
     let hints = "";
     if (ctx.slashCommand) {
       const hintText = ctx.slashCommandPlaceholder || "to run again";
@@ -256,16 +306,17 @@ function getFooterMessage(ctx) {
       if (hints) hints += "\n";
       hints += `> <sub>Add label <em>{label_command}</em> to run again</sub>`;
     }
+    const claim = buildWorkQueueClaimFooter();
     const renderedHints = renderTemplate(hints, templateContext);
-    if (!renderedHints) return "";
+    if (!claim.length && !renderedHints) return [];
     const separator = renderedFooter && !renderedFooter.endsWith("\n") ? "\n" : "";
-    return separator + renderedHints;
+    return [separator, ...claim, ...(claim.length && renderedHints ? ["\n"] : []), renderedHints];
   };
 
   // Use custom footer template if configured
   if (messages?.footer) {
     const renderedCustomFooter = renderTemplate(messages.footer, templateContext);
-    return renderedCustomFooter + getRunAgainHints(renderedCustomFooter);
+    return [renderedCustomFooter, ...getFooterHints(renderedCustomFooter)];
   }
 
   // Default footer template - includes emoji prefix when available
@@ -290,7 +341,7 @@ function getFooterMessage(ctx) {
     defaultFooter += " · [◷]({history_url})";
   }
   const renderedDefaultFooter = renderTemplate(defaultFooter, templateContext);
-  return renderedDefaultFooter + getRunAgainHints(renderedDefaultFooter);
+  return [renderedDefaultFooter, ...getFooterHints(renderedDefaultFooter)];
 }
 
 /**
@@ -420,6 +471,16 @@ function getFooterWorkflowRecompileCommentMessage(ctx) {
  * @returns {string} Footer message for agent failure tracking issues
  */
 function getFooterAgentFailureIssueMessage(ctx) {
+  const { template, context } = getFooterAgentFailureIssueTemplate(ctx);
+  return renderTemplate(template, context);
+}
+
+/**
+ * Expose the template separately so structured renderers can substitute literal
+ * metadata after parsing, rather than interpreting metadata as Markdown.
+ * @param {AgentFailureContext} ctx
+ */
+function getFooterAgentFailureIssueTemplate(ctx) {
   const messages = getMessages();
 
   // Pre-compute history_link as a ready-to-use markdown suffix (empty string when unavailable)
@@ -450,7 +511,7 @@ function getFooterAgentFailureIssueMessage(ctx) {
   const hasExplicitContextAIC = ctx.aiCredits !== undefined && ctx.aiCredits !== null;
   const explicitContextAIC = parseExplicitContextAIC(ctx.aiCredits);
   const aiCredits = hasExplicitContextAIC ? explicitContextAIC : envAIC;
-  const aiCreditsFormatted = hasExplicitContextAIC ? (explicitContextAIC ? formatAIC(explicitContextAIC) : undefined) : envAICFormatted;
+  const aiCreditsFormatted = hasExplicitContextAIC ? (explicitContextAIC ? formatEstimatedAIC(explicitContextAIC) : undefined) : envAICFormatted;
   const aiCreditsSuffix = hasExplicitContextAIC ? buildAICEntry("", explicitContextAIC, agentModelIdentifier).suffix : envAICSuffix;
   const aiCreditsSuffixForTemplate = `${aiCreditsSuffix}${ambientContextSuffix}`;
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || undefined;
@@ -481,29 +542,29 @@ function getFooterAgentFailureIssueMessage(ctx) {
     ambientContext,
     ambientContextFormatted,
     ambientContextSuffix,
+    failureMetricsSuffix: `${aiCredits ? aiCreditsSuffix : ""}${ambientContext ? ambientContextSuffix : ""}`,
   });
 
   // Use custom agent failure issue footer if configured, otherwise use default footer
-  let footer;
+  let template;
   if (messages?.agentFailureIssue) {
-    footer = renderTemplate(messages.agentFailureIssue, templateContext);
+    template = messages.agentFailureIssue;
+    // User templates retain unknown placeholders as scalar text, not report nodes.
+    for (const [placeholder, key] of template.matchAll(/\{(\w+)\}/g)) {
+      if (!Object.hasOwn(templateContext, key)) {
+        Object.defineProperty(templateContext, key, { value: placeholder, enumerable: true });
+      }
+    }
   } else {
     // Default footer template with link to workflow run
-    let defaultFooter = "> Generated from [{workflow_name}]({run_url})";
-    if (aiCredits) {
-      defaultFooter += aiCreditsSuffix;
-    }
-    if (ambientContext) {
-      defaultFooter += ambientContextSuffix;
-    }
+    template = "> Generated from [{workflow_name}]({run_url}){failure_metrics_suffix}";
     // Append history link when available
     if (ctx.historyUrl) {
-      defaultFooter += " · [◷]({history_url})";
+      template += " · [◷]({history_url})";
     }
-    footer = renderTemplate(defaultFooter, templateContext);
   }
 
-  return footer;
+  return { template, context: templateContext };
 }
 
 /**
@@ -542,7 +603,7 @@ function getFooterAgentFailureCommentMessage(ctx) {
   const hasExplicitContextAIC = ctx.aiCredits !== undefined && ctx.aiCredits !== null;
   const explicitContextAIC = parseExplicitContextAIC(ctx.aiCredits);
   const aiCredits = hasExplicitContextAIC ? explicitContextAIC : envAIC;
-  const aiCreditsFormatted = hasExplicitContextAIC ? (explicitContextAIC ? formatAIC(explicitContextAIC) : undefined) : envAICFormatted;
+  const aiCreditsFormatted = hasExplicitContextAIC ? (explicitContextAIC ? formatEstimatedAIC(explicitContextAIC) : undefined) : envAICFormatted;
   const aiCreditsSuffix = hasExplicitContextAIC ? buildAICEntry("", explicitContextAIC, agentModelIdentifier).suffix : envAICSuffix;
   const aiCreditsSuffixForTemplate = `${aiCreditsSuffix}${ambientContextSuffix}`;
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || undefined;
@@ -610,10 +671,22 @@ function getFooterAgentFailureCommentMessage(ctx) {
  * @returns {string} XML comment marker with workflow metadata
  */
 function generateXMLMarker(workflowName, runUrl) {
+  return `<!-- ${getAgenticWorkflowMetadata(workflowName, runUrl)
+    .map(field => `${field.key}: ${field.value}`)
+    .join(", ")} -->`;
+}
+
+/**
+ * @param {string} workflowName
+ * @param {string} runUrl
+ * @returns {{key: string, value: string}[]}
+ */
+function getAgenticWorkflowMetadata(workflowName, runUrl) {
   // Read engine metadata from environment variables
   const engineId = process.env.GH_AW_ENGINE_ID || "";
   const engineVersion = process.env.GH_AW_ENGINE_VERSION || "";
-  const engineModel = process.env.GH_AW_ENGINE_MODEL || "";
+  const attribution = resolveEffectiveModel();
+  const engineModel = attribution.model || (attribution.routing ? attribution.requestedModel : validateModelIdentifier(process.env.GH_AW_ENGINE_MODEL));
   const trackerId = process.env.GH_AW_TRACKER_ID || "";
   const runId = process.env.GITHUB_RUN_ID || "";
   const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
@@ -622,43 +695,48 @@ function generateXMLMarker(workflowName, runUrl) {
   const parts = [];
 
   // Always include agentic-workflow name
-  parts.push(`gh-aw-agentic-workflow: ${workflowName}`);
+  parts.push({ key: "gh-aw-agentic-workflow", value: workflowName });
 
   // Add tracker-id if available (for searchability and tracing)
   if (trackerId) {
-    parts.push(`gh-aw-tracker-id: ${trackerId}`);
+    parts.push({ key: "gh-aw-tracker-id", value: trackerId });
   }
 
   // Add engine ID if available
   if (engineId) {
-    parts.push(`engine: ${engineId}`);
+    parts.push({ key: "engine", value: engineId });
   }
 
   // Add version if available
   if (engineVersion) {
-    parts.push(`version: ${engineVersion}`);
+    parts.push({ key: "version", value: engineVersion });
   }
 
   // Add model if available
   if (engineModel) {
-    parts.push(`model: ${engineModel}`);
+    parts.push({ key: "model", value: engineModel });
+  }
+  if (attribution.routing?.status === "selected") {
+    if (attribution.effort) parts.push({ key: "effort", value: attribution.effort });
+    parts.push({ key: "routed", value: "true" });
+  } else if (attribution.routing) {
+    parts.push({ key: "routed", value: attribution.routing.status });
   }
 
   // Add numeric run ID if available
   if (runId) {
-    parts.push(`id: ${runId}`);
+    parts.push({ key: "id", value: runId });
   }
 
   // Add workflow identifier if available
   if (workflowId) {
-    parts.push(`workflow_id: ${workflowId}`);
+    parts.push({ key: "workflow_id", value: workflowId });
   }
 
   // Always include run URL
-  parts.push(`run: ${runUrl}`);
+  parts.push({ key: "run", value: runUrl });
 
-  // Return the XML comment marker
-  return `<!-- ${parts.join(", ")} -->`;
+  return parts;
 }
 
 /**
@@ -682,6 +760,22 @@ function generateXMLMarker(workflowName, runUrl) {
  * @returns {string} Complete footer text
  */
 function generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, options) {
+  return renderFooterParts(buildGeneratedFooterParts(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, options));
+}
+
+/**
+ * @param {string} workflowName
+ * @param {string} runUrl
+ * @param {string} workflowSource
+ * @param {string} workflowSourceURL
+ * @param {number|undefined} triggeringIssueNumber
+ * @param {number|undefined} triggeringPRNumber
+ * @param {number|undefined} triggeringDiscussionNumber
+ * @param {string|null|undefined} [historyUrl]
+ * @param {GenerateFooterOptions} [options]
+ * @returns {FooterPart[]}
+ */
+function buildGeneratedFooterParts(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, options) {
   // Determine triggering number (issue takes precedence, then PR, then discussion)
   let triggeringNumber;
   /** @type {"issue"|"PR"|"discussion"|undefined} */
@@ -758,29 +852,36 @@ function generateFooterWithMessages(workflowName, runUrl, workflowSource, workfl
     // ignore errors so the rest of the footer is always preserved
   }
 
-  // Attribution footer line comes after any guard notices
   // Attribution footer line comes after any guard notices. Only add the separating
   // blank line when guard notices are present, otherwise the footer would start with
   // stray blank lines that render as a large gap after the body.
-  let footer = guardNotices ? guardNotices.trim() + "\n\n" + getFooterMessage(ctx) : getFooterMessage(ctx);
+  const parts = [...(guardNotices ? [guardNotices.trim() + "\n\n"] : []), ...getFooterMessageParts(ctx)];
+  let suffix = "";
 
   // Add installation instructions if source is available
   const installMessage = getFooterInstallMessage(ctx);
   if (installMessage) {
-    footer += "\n>\n" + installMessage;
+    suffix += "\n>\n" + installMessage;
   }
 
   // Add missing tools and data sections if available
+  const collectedMissings = getCollectedMissings();
   const missingInfoSections = getMissingInfoSections();
   if (missingInfoSections) {
-    footer += missingInfoSections;
+    parts.push(suffix, {
+      type: "diagnostic_sections",
+      markdown: missingInfoSections,
+      // Legacy string publishers do not parse diagnostic text.
+      buildChildren: () => generateMissingInfoReportSections(collectedMissings),
+    });
+    suffix = "";
   }
 
   // Add XML comment marker for traceability
-  footer += "\n\n" + generateXMLMarker(workflowName, runUrl);
+  suffix += "\n\n" + generateXMLMarker(workflowName, runUrl);
 
-  footer += "\n";
-  return footer;
+  parts.push(suffix + "\n");
+  return parts;
 }
 
 module.exports = {
@@ -791,7 +892,10 @@ module.exports = {
   getFooterWorkflowRecompileMessage,
   getFooterWorkflowRecompileCommentMessage,
   getFooterAgentFailureIssueMessage,
+  getFooterAgentFailureIssueTemplate,
+  getAgenticWorkflowMetadata,
   getFooterAgentFailureCommentMessage,
   generateFooterWithMessages,
+  buildGeneratedFooterParts,
   generateXMLMarker,
 };

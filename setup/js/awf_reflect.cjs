@@ -18,12 +18,13 @@
 require("./shim.cjs");
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const net = require("net");
 const tls = require("tls");
 const { withRetry, sleep } = require("./error_recovery.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { AWF_REFLECT_OUTPUT_PATH } = require("./awf_reflect_paths.cjs");
+const { qualifyModelForMultiProvider, isCopilotProviderName } = require("./copilot_sdk_multi_provider.cjs");
 
 function parseReflectTimeoutMs(value) {
   const rawValue = String(value || "").trim();
@@ -38,8 +39,6 @@ function parseReflectTimeoutMs(value) {
 // The api-proxy sidecar exposes /reflect on its management port (port 10000) inside the AWF
 // Docker network. From the agent container, the proxy is reachable via the "api-proxy" hostname.
 const AWF_API_PROXY_REFLECT_URL = "http://api-proxy:10000/reflect";
-// Persist outside the read-only gh-aw infrastructure mount.
-const AWF_REFLECT_OUTPUT_PATH = path.join(process.env.RUNNER_TEMP || os.tmpdir(), "awf-reflect.json");
 // Milliseconds to wait for the /reflect endpoint before giving up.
 const AWF_REFLECT_TIMEOUT_MS = parseReflectTimeoutMs(process.env.GH_AW_REFLECT_TIMEOUT_MS);
 // Milliseconds to wait for each models_url fallback fetch (shorter than the main reflect timeout).
@@ -83,6 +82,13 @@ const REFLECT_PROVIDER_ANTHROPIC = "anthropic";
 /**
  * @typedef {{
  *   endpoints?: ReflectEndpoint[],
+ *   routing?: {
+ *     status?: string,
+ *     failure_code?: string,
+ *     mode?: string,
+ *     selection?: { id?: string },
+ *     router?: { version?: string },
+ *   },
  * }} ReflectData
  */
 
@@ -375,7 +381,7 @@ async function enrichReflectModels(reflectData, timeoutMs, logger) {
  *   reflectUrl: string,
  *   outputPath: string,
  *   bytesWritten?: number,
- *   reflectData?: object,
+ *   reflectData?: ReflectData,
  *   reason?: "disabled"|"unexpected_status"|"timeout"|"request_failed",
  *   status?: number,
  *   error?: string,
@@ -596,6 +602,7 @@ function isOpenAIModelName(model) {
 
 /**
  * Look up a model entry in the models.json catalog, case-insensitively.
+ * Exact model IDs take precedence over the base-model fallback for `-utility` variants.
  *
  * @param {any} modelsJson
  * @param {string} modelName
@@ -604,6 +611,7 @@ function isOpenAIModelName(model) {
  */
 function getCatalogModelEntry(modelsJson, modelName, providerName) {
   const model = String(modelName || "")
+    .split("?")[0]
     .toLowerCase()
     .trim();
   const provider = String(providerName || "")
@@ -624,17 +632,26 @@ function getCatalogModelEntry(modelsJson, modelName, providerName) {
             .trim() === provider
       )
     : Object.entries(providers);
+  const modelEntriesByProvider = [];
   for (const [, providerData] of providerEntries) {
     const models = providerData && typeof providerData === "object" ? providerData.models : null;
     if (!models || typeof models !== "object" || Array.isArray(models)) continue;
+    const modelEntriesByName = new Map();
     for (const [catalogModel, catalogEntry] of Object.entries(models)) {
-      if (
-        String(catalogModel || "")
-          .toLowerCase()
-          .trim() === model
-      ) {
-        return catalogEntry && typeof catalogEntry === "object" && !Array.isArray(catalogEntry) ? catalogEntry : null;
-      }
+      const normalizedCatalogModel = String(catalogModel || "")
+        .toLowerCase()
+        .trim();
+      if (!modelEntriesByName.has(normalizedCatalogModel)) modelEntriesByName.set(normalizedCatalogModel, catalogEntry);
+    }
+    modelEntriesByProvider.push(modelEntriesByName);
+  }
+  const lookupModelNames = [model];
+  if (model.endsWith("-utility")) lookupModelNames.push(model.slice(0, -"-utility".length));
+  for (const lookupModelName of lookupModelNames) {
+    for (const modelEntriesByName of modelEntriesByProvider) {
+      if (!modelEntriesByName.has(lookupModelName)) continue;
+      const catalogEntry = modelEntriesByName.get(lookupModelName);
+      return catalogEntry && typeof catalogEntry === "object" && !Array.isArray(catalogEntry) ? catalogEntry : null;
     }
   }
   return null;
@@ -702,7 +719,8 @@ function inferProviderTypeForModel(endpointProvider, modelName, catalogEntryOrMo
  * Resolution order:
  *   1. For Anthropic provider types: undefined (wireApi ignored by SDK).
  *   2. `models.json` explicit `wire_api`/`wireApi`.
- *   3. Heuristic default for OpenAI/Azure-compatible models: "completions".
+ *   3. Heuristic default for GPT-5+ models: "responses".
+ *   4. Default for other OpenAI/Azure-compatible models: "completions".
  *
  * @param {"openai" | "azure" | "anthropic"} providerType
  * @param {string} modelName
@@ -727,6 +745,9 @@ function inferWireApiForModel(providerType, modelName, catalogEntryOrModelsJson)
     .trim();
   if (normalizedWireApi === "responses" || normalizedWireApi === "completions") {
     return /** @type {"responses" | "completions"} */ normalizedWireApi;
+  }
+  if (/^gpt-(?:[5-9]|\d{2,})(?:[.-]|$)/i.test(model.split("?")[0])) {
+    return "responses";
   }
   return "completions";
 }
@@ -834,6 +855,23 @@ function resolveProviderEndpointFromReflect(options) {
 }
 
 /**
+ * Check that fresh reflection selects a configured endpoint authenticated by Azure OIDC.
+ *
+ * @param {any} reflectData
+ * @param {string} provider
+ * @returns {boolean}
+ */
+function hasAzureOIDCProviderEndpoint(reflectData, provider) {
+  const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints : [];
+  const resolved = resolveProviderEndpointFromReflect({ provider, reflectData, logger: () => {} });
+  const aliases = REFLECT_PROVIDER_ALIASES[normalizeReflectProviderName(provider)] || new Set([normalizeReflectProviderName(provider)]);
+  const endpoint = endpoints.find(
+    candidate => candidate?.configured === true && aliases.has(normalizeReflectProviderName(candidate.provider)) && normalizeReflectProviderName(candidate.provider) === normalizeReflectProviderName(resolved?.endpointProvider)
+  );
+  return Boolean(endpoint && endpoint.auth_type === "github-oidc/azure");
+}
+
+/**
  * Resolve the OpenAI-compatible chat endpoint for a configured provider.
  *
  * Goose requires the endpoint origin and request path in separate environment
@@ -899,16 +937,19 @@ function resolveOpenAICompatibleEndpointFromReflect(options) {
  * Returns `null` when no configured endpoints are present or the data is
  * unavailable.
  *
- * Each endpoint becomes a `NamedProviderConfig` (using the endpoint's `provider`
- * field as the stable name) and every model advertised by that endpoint becomes a
- * `ProviderModelConfig` tuple `{ id, provider }` referencing it.  Callers can
- * derive provider-qualified selection ids as `"<providerName>/<modelId>"` if needed.
+ * Copilot endpoints become separate responses and completions providers. Other
+ * endpoints retain a single provider. Models reference their inferred wire API.
  *
  * The primary model is the first model that matches `options.model` (if set),
- * otherwise the first model across all providers.
+ * otherwise (only when no model is configured) the first model across all providers.
+ * A configured model that matches no model is never replaced by another model: the
+ * result has an empty `model` and `configuredModelNotFound: true` so the caller fails.
+ * A valid `options.wireApi` routes only the configured Copilot model; it never
+ * changes the wire API used by the other models. The primary model is qualified.
  *
  * @param {{
  *   model?: string,
+ *   wireApi?: string,
  *   reflectData: ReflectData | null | undefined,
  *   modelsJson?: object | null,
  *   logger?: (msg: string) => void,
@@ -917,6 +958,7 @@ function resolveOpenAICompatibleEndpointFromReflect(options) {
  *   model: string,
  *   providers: Array<{ name: string, type: "openai" | "azure" | "anthropic", baseUrl: string, wireApi?: "completions" | "responses" }>,
  *   models: Array<{ id: string, provider: string }>,
+ *   configuredModelNotFound?: boolean,
  * } | null}
  */
 function resolveMultiProviderFromReflect(options) {
@@ -947,6 +989,11 @@ function resolveMultiProviderFromReflect(options) {
   // provider label (e.g. two "copilot" entries at different ports).
   /** @type {Map<string, number>} */
   const providerNameCount = new Map();
+  const configuredWireApi = String(options?.wireApi || "")
+    .toLowerCase()
+    .trim();
+  let configuredModelMapped = false;
+  let mappedConfiguredModel = "";
 
   for (const endpoint of endpoints) {
     const baseUrl = endpointBaseUrl(endpoint);
@@ -962,18 +1009,62 @@ function resolveMultiProviderFromReflect(options) {
     }
 
     // Ensure unique provider names by appending a suffix when the same name appears twice.
-    const existing = providerNameCount.get(rawProviderName) ?? 0;
-    providerNameCount.set(rawProviderName, existing + 1);
-    const providerName = existing === 0 ? rawProviderName : `${rawProviderName}-${existing}`;
+    const isCopilot = isCopilotProviderName(rawProviderName);
+    const stableProviderName = isCopilot ? "copilot" : rawProviderName;
+    const existing = providerNameCount.get(stableProviderName) ?? 0;
+    providerNameCount.set(stableProviderName, existing + 1);
+    const suffix = existing === 0 ? "" : `-${existing}`;
+    const providerName = `${stableProviderName}${suffix}`;
 
     const endpointModels = Array.isArray(endpoint.models) ? endpoint.models.filter(m => typeof m === "string" && m.trim().length > 0) : [];
 
-    // Infer provider type and wire API using the configured model if available,
-    // otherwise fall back to the first model.
-    // For multi-model providers (e.g. Copilot), different models may have different wire APIs,
-    // so we prefer the configured model to ensure the correct wireApi is selected.
+    if (isCopilot) {
+      /** @type {Array<"responses" | "completions">} */
+      const wireApis = ["responses", "completions"];
+      for (const wireApi of wireApis) {
+        providers.push({ name: `copilot-${wireApi}${suffix}`, type: "openai", baseUrl, wireApi });
+      }
+      // Routing metadata uses model_id (not id); HTTP paths exclude ws:/responses.
+      const routingModels = Array.isArray(endpoint.routing_models) ? endpoint.routing_models : Array.isArray(rd.routing_models) ? rd.routing_models : [];
+      for (const modelId of endpointModels) {
+        const catalogEntry = getCatalogModelEntry(options?.modelsJson ?? null, modelId, "github-copilot");
+        let wireApi = inferWireApiForModel("openai", modelId, catalogEntry);
+        const metadata = routingModels.find(model => model?.model_id === modelId);
+        const supported = metadata?.supported_endpoints;
+        if (Array.isArray(supported)) {
+          const responses = supported.includes("/responses");
+          const completions = supported.includes("/chat/completions");
+          if (!responses && !completions) {
+            logger(`sdk-mode(multi): skipping Copilot model="${modelId}" with no supported SDK wire API`);
+            continue;
+          }
+          if (responses !== completions) wireApi = responses ? "responses" : "completions";
+        }
+        const matchesConfigured = configuredModel === modelId || configuredModel === `copilot/${modelId}` || ["responses", "completions"].some(api => configuredModel === `copilot-${api}${suffix}/${modelId}`);
+        if (!configuredModelMapped && matchesConfigured) {
+          configuredModelMapped = true;
+          const qualifiedWireApi = wireApis.find(api => configuredModel === `copilot-${api}${suffix}/${modelId}`);
+          if (qualifiedWireApi && (!Array.isArray(supported) || supported.includes(qualifiedWireApi === "responses" ? "/responses" : "/chat/completions"))) {
+            wireApi = qualifiedWireApi;
+          }
+          if (configuredWireApi === "responses" || configuredWireApi === "completions") {
+            const requestedEndpoint = configuredWireApi === "responses" ? "/responses" : "/chat/completions";
+            if (Array.isArray(supported) && !supported.includes(requestedEndpoint)) {
+              throw new Error(`Model endpoint mismatch: model "${modelId}" with COPILOT_PROVIDER_WIRE_API=${configuredWireApi} requires ${requestedEndpoint}; supported endpoints: ${supported.join(", ")}`);
+            }
+            wireApi = configuredWireApi;
+          }
+          mappedConfiguredModel = `copilot-${wireApi}${suffix}/${modelId}`;
+        }
+        models.push({ id: modelId, provider: `copilot-${wireApi}${suffix}` });
+      }
+      logger(`sdk-mode(multi): split provider="${providerName}" into responses/completions modelCount=${endpointModels.length} baseUrl="${baseUrl}"`);
+      continue;
+    }
+
+    // Other endpoints retain their provider-wide inference.
     const firstModel = endpointModels.length > 0 ? endpointModels[0] : "";
-    const modelForInference = configuredModel && endpointModels.includes(configuredModel) ? configuredModel : firstModel;
+    const modelForInference = endpointModels.find(modelId => configuredModel === modelId || configuredModel === `${providerName}/${modelId}`) || firstModel;
     const catalogProviderName = rawProviderName.toLowerCase() === "copilot" ? "github-copilot" : rawProviderName;
     const catalogEntry = modelForInference ? getCatalogModelEntry(options?.modelsJson ?? null, modelForInference, catalogProviderName) : null;
     const providerType = inferProviderTypeForModel(rawProviderName, modelForInference, catalogEntry);
@@ -1001,20 +1092,33 @@ function resolveMultiProviderFromReflect(options) {
     return null;
   }
 
-  // Determine the primary model: prefer the configured model if it appears in the model list;
-  // otherwise fall back to the first model across all providers.
-  let primaryModel = "";
-  if (configuredModel) {
-    const match = models.find(m => m.id === configuredModel);
-    if (match) primaryModel = match.id;
+  // Determine the primary model: use the configured model if it appears in the model list.
+  // Only when no model is configured fall back to the first model across all providers;
+  // a configured model that is not found is never silently replaced by another model.
+  let primaryModel = qualifyModelForMultiProvider(configuredModel, { providers, models }) || mappedConfiguredModel;
+  if (!primaryModel && configuredModel && models.length > 0) {
+    // Provisional diagnostic: the caller may still refresh /reflect, so this wording must not
+    // match the unsupported-model classifier (agent_error_patterns.cjs MODEL_NOT_SUPPORTED_PATTERN).
+    logger(`sdk-mode(multi): no awf-reflect endpoint lists the configured model "${configuredModel}"; not selecting a different model`);
+    return { model: "", providers, models, configuredModelNotFound: true };
   }
   if (!primaryModel && models.length > 0) {
-    primaryModel = models[0].id;
+    primaryModel = `${models[0].provider}/${models[0].id}`;
   }
 
   if (!primaryModel) {
     logger("sdk-mode(multi): no models found in awf-reflect endpoints; cannot build multi-provider config");
     return null;
+  }
+
+  const primaryProviderName = models.find(m => `${m.provider}/${m.id}` === primaryModel)?.provider;
+  const primaryProvider = providers.find(p => p.name === primaryProviderName);
+  const wireApi = String(options?.wireApi || "")
+    .toLowerCase()
+    .trim();
+  if (primaryProvider && !primaryProvider.name.startsWith("copilot-") && primaryProvider.type !== "anthropic" && (wireApi === "responses" || wireApi === "completions")) {
+    primaryProvider.wireApi = wireApi;
+    logger(`sdk-mode(multi): primary provider="${primaryProvider.name}" wireApi="${wireApi}" selected from configured wire API`);
   }
 
   logger(`sdk-mode(multi): resolved ${providers.length} providers, ${models.length} models (primary model: ${primaryModel})`);
@@ -1051,6 +1155,7 @@ if (typeof module !== "undefined" && module.exports) {
     REFLECT_PROVIDER_ALIASES,
     resolveOpenAICompatibleEndpointFromReflect,
     resolveProviderEndpointFromReflect,
+    hasAzureOIDCProviderEndpoint,
     resolveMultiProviderFromReflect,
     rewriteAPIProxyURLForHostBridge,
   };

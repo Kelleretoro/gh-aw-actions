@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonl } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -12,9 +13,10 @@ const { parsePositiveCompactNumber } = require("./numeric_limits.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { createRateLimitAwareGithub } = require("./github_rate_limit_logger.cjs");
 const { scanDailyAIC } = require("./daily_aic_scan.cjs");
-const { createAPIBudget, retryNotBefore, safeResponseHeaders } = require("./daily_aic_api_budget.cjs");
-const { loadBillableJobs, allBillableJobsSkipped, sumCoveredComponents } = require("./daily_aic_component_coverage.cjs");
-const { readLedgerEntries } = require("./daily_aic_repo_memory_ledger.cjs");
+const { API_READ_OPERATIONS, createAPIBudget, retryNotBefore, safeResponseHeaders, isQuotaError, getAPIReadFailure } = require("./daily_aic_api_budget.cjs");
+const { getGitHubAPIDiagnostic } = require("./github_api_diagnostics.cjs");
+const { loadBillableJobs, allBillableJobsNotStarted, allBillableJobsSkipped, sumCoveredComponents } = require("./daily_aic_component_coverage.cjs");
+const { readLedgerEntries, readLedgerCoverageStart, WINDOW_MS } = require("./daily_aic_repo_memory_ledger.cjs");
 
 const PRIMARY_GUARDRAIL_ARTIFACT_NAMES = ["usage"];
 const MAX_WORKFLOW_RUN_PAGES = 10;
@@ -30,8 +32,8 @@ const REPO_MEMORY_BACKEND = "repo-memory";
 /**
  * @returns {Promise<any>}
  */
-async function getArtifactClient(onResponse) {
-  return new DefaultArtifactClient({ onResponse });
+async function getArtifactClient(onResponse, request) {
+  return new DefaultArtifactClient({ onResponse, request });
 }
 
 /**
@@ -157,9 +159,8 @@ function loadAICUsageCache(filePath) {
     const cutoff = Date.now() - CACHE_RETENTION_MS;
     const { keptLines, prunedCount: skippedStale } = pruneStaleJSONLCacheLines(content, cutoff);
     let loaded = 0;
-    for (const line of keptLines) {
+    for (const entry of iterateJsonl(keptLines)) {
       try {
-        const entry = JSON.parse(line);
         const runId = Number(entry?.run_id);
         const rawAic = entry?.aic;
         const aic = typeof rawAic === "number" ? rawAic : NaN;
@@ -299,25 +300,45 @@ async function inspectLegacyAgentArtifact(artifactClient, artifacts, downloadRoo
  * @returns {Promise<number>}
  */
 async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspection) {
-  const components = run ? await loadBillableJobs(inspection, owner, repo, run) : null;
-  if (components && allBillableJobsSkipped(components)) {
+  const { components, priorJobs } = run ? await loadBillableJobs(inspection, owner, repo, run) : { components: null, priorJobs: null };
+  if (components && allBillableJobsNotStarted(components)) {
+    inspection.accountingReason = "confirmed_zero";
+    for (const [component, job] of components) {
+      core.info(
+        `[daily-workflow-aic] Computed component AIC: ${JSON.stringify({
+          runId,
+          component,
+          jobId: job.id,
+          runAttempt: job.run_attempt,
+          conclusion: job.conclusion,
+          aic: 0,
+          reason: job.conclusion === "skipped" ? "job_skipped" : "runner_not_assigned",
+        })}`
+      );
+    }
     logDailyGuardrail("Computed run AIC", {
       runId,
       aic: 0,
-      reason: components.size === 0 ? "no_billable_jobs" : "all_billable_jobs_skipped",
+      reason: components.size === 0 ? "no_billable_jobs" : allBillableJobsSkipped(components) ? "all_billable_jobs_skipped" : "all_billable_jobs_not_started",
     });
     return 0;
   }
-  const { artifacts } = await artifactClient.listArtifacts({
-    latest: true,
-    findBy: {
-      token,
-      workflowRunId: runId,
-      repositoryOwner: owner,
-      repositoryName: repo,
-    },
-  });
-  const artifactSummaries = artifacts.map(item => ({ id: item?.id ?? null, name: item?.name || "" }));
+  let artifacts;
+  try {
+    ({ artifacts } = await artifactClient.listArtifacts({
+      latest: true,
+      findBy: {
+        token,
+        workflowRunId: runId,
+        repositoryOwner: owner,
+        repositoryName: repo,
+      },
+    }));
+  } catch (error) {
+    logDailyGuardrail("Artifact discovery failed", { runId, operation: "listArtifacts", error: getErrorMessage(error), hint: "Check Actions read permissions, artifact retention, and GitHub API availability." });
+    throw error;
+  }
+  const artifactSummaries = artifacts.map(item => ({ id: item?.id ?? null, name: item?.name || "", expired: !!item?.expired }));
   logDailyGuardrail("Listed workflow artifacts", {
     runId,
     artifactCount: artifacts.length,
@@ -327,7 +348,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
   const artifact = artifacts.find(item => item?.name && matchesGuardrailArtifactName(item.name));
   if (!artifact) {
     if (run) {
-      throw new Error(`No usage artifact proves AIC for completed run ${runId}`);
+      throw new Error(`No usage artifact proves AIC for completed run ${runId}; check artifact upload and retention`);
     }
     logDailyGuardrail("No matching guardrail artifact found", {
       runId,
@@ -346,7 +367,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
     return 0;
   }
   if (run && (artifact.expired || !artifact.createdAt || !Number.isFinite(artifact.createdAt.getTime()))) {
-    throw new Error(`Usage artifact does not cover the completed attempt for run ${runId}`);
+    throw new Error(`Usage artifact ${artifact.id} does not cover the completed attempt for run ${runId} (expired: ${!!artifact.expired}); check artifact retention and attempt timestamps`);
   }
 
   logDailyGuardrail("Selected guardrail artifact", {
@@ -384,7 +405,7 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
     });
     const artifactRoot = download.downloadPath || downloadRoot;
     const legacyAgentEvidence = components ? await inspectLegacyAgentArtifact(artifactClient, artifacts, artifactRoot, token, owner, repo, run, components) : null;
-    const aic = components ? sumCoveredComponents(artifactRoot, components, artifact.createdAt.getTime(), artifacts, artifact.name, run.run_attempt, run.id, legacyAgentEvidence) : sumAICFromUsageJSONLFiles(usageJSONLFiles);
+    const aic = components ? sumCoveredComponents(artifactRoot, components, artifact.createdAt.getTime(), artifacts, artifact.name, run.run_attempt, run.id, legacyAgentEvidence, priorJobs) : sumAICFromUsageJSONLFiles(usageJSONLFiles);
     logDailyGuardrail("Computed run AIC from artifact", {
       runId,
       artifactId: artifact.id,
@@ -392,6 +413,9 @@ async function getRunAIC(artifactClient, runId, token, owner, repo, run, inspect
       reason: components ? "covered_components" : "usage_files",
     });
     return aic;
+  } catch (error) {
+    logDailyGuardrail("Artifact accounting failed", { runId, artifactId: artifact.id, artifactName: artifact.name, error: getErrorMessage(error), hint: "Check Actions read permissions, artifact retention, and accounting file coverage." });
+    throw error;
   } finally {
     fs.rmSync(downloadRoot, { recursive: true, force: true });
   }
@@ -456,6 +480,7 @@ function hasHttpStatus(error, status) {
  * @returns {boolean}
  */
 function isStructuralGuardrailError(error) {
+  if (isQuotaError(error)) return false;
   const response = error && typeof error === "object" && "response" in error ? error.response : null;
   const headers = safeResponseHeaders(response && typeof response === "object" && "headers" in response ? response.headers : null);
   return hasHttpStatus(error, 404) || hasHttpStatus(error, 401) || (hasHttpStatus(error, 403) && headers["x-ratelimit-remaining"] !== "0" && !headers["retry-after"]);
@@ -468,20 +493,29 @@ function isStructuralGuardrailError(error) {
 /**
  * @param {any} githubClient
  * @param {{ owner: string, repo: string, workflowId: number, created: string, page: number, perPage: number, lookupMode: WorkflowRunLookupMode }} params
+ * @param {{ request: Function }} [budget]
  * @returns {Promise<{ response: any, lookupMode: WorkflowRunLookupMode, sourceRunCount: number, oldestUnfilteredCreatedAt?: string | null }>}
  */
-async function listCompletedWorkflowRunsPage(githubClient, params) {
+async function listCompletedWorkflowRunsPage(githubClient, params, budget = createAPIBudget()) {
   const { owner, repo, workflowId, created, page, perPage, lookupMode } = params;
   if (lookupMode === "repo_workflow_id_fallback") {
-    const response = await githubClient.rest.actions.listWorkflowRunsForRepo({
-      owner,
-      repo,
-      status: "completed",
-      created,
-      per_page: perPage,
-      page,
-    });
-    const allRuns = response.data.workflow_runs || [];
+    const response = await budget.request(
+      () =>
+        githubClient.rest.actions.listWorkflowRunsForRepo({
+          owner,
+          repo,
+          status: "completed",
+          created,
+          per_page: perPage,
+          page,
+        }),
+      true,
+      API_READ_OPERATIONS.REPOSITORY_HISTORY
+    );
+    const allRuns = response.data?.workflow_runs;
+    if (!Array.isArray(allRuns) || allRuns.some(run => !Number.isSafeInteger(run?.workflow_id) || run.workflow_id <= 0)) {
+      throw new Error("Incomplete daily AIC repository workflow history");
+    }
     const filteredRuns = allRuns.filter(run => run?.workflow_id === workflowId);
     logDailyGuardrail("Filtered repository workflow runs by workflow ID fallback", {
       workflowId,
@@ -508,36 +542,46 @@ async function listCompletedWorkflowRunsPage(githubClient, params) {
   }
 
   try {
-    const response = await githubClient.rest.actions.listWorkflowRuns({
-      owner,
-      repo,
-      workflow_id: workflowId,
-      status: "completed",
-      per_page: perPage,
-      page,
-    });
+    const response = await budget.request(
+      () =>
+        githubClient.rest.actions.listWorkflowRuns({
+          owner,
+          repo,
+          workflow_id: workflowId,
+          status: "completed",
+          per_page: perPage,
+          page,
+        }),
+      true,
+      API_READ_OPERATIONS.WORKFLOW_HISTORY
+    );
+    if (!Array.isArray(response.data?.workflow_runs)) throw new Error("Incomplete daily AIC workflow history");
     return {
       response,
       lookupMode,
       sourceRunCount: response?.data?.workflow_runs?.length || 0,
     };
   } catch (error) {
-    if (!hasHttpStatus(error, 404)) {
+    if (!hasHttpStatus(error, 404) || isQuotaError(error) || safeResponseHeaders(error?.response?.headers)["retry-after"] != null) {
       throw error;
     }
     logDailyGuardrail("Workflow-specific run history query returned 404; falling back to repository run listing by workflow ID", {
       workflowId,
       page,
     });
-    return listCompletedWorkflowRunsPage(githubClient, {
-      owner,
-      repo,
-      workflowId,
-      created,
-      page,
-      perPage,
-      lookupMode: "repo_workflow_id_fallback",
-    });
+    return listCompletedWorkflowRunsPage(
+      githubClient,
+      {
+        owner,
+        repo,
+        workflowId,
+        created,
+        page,
+        perPage,
+        lookupMode: "repo_workflow_id_fallback",
+      },
+      budget
+    );
   }
 }
 
@@ -545,13 +589,15 @@ async function listCompletedWorkflowRunsPage(githubClient, params) {
  * @param {string} workflowName
  * @param {string} actorLogin
  * @param {number} threshold
- * @param {Array<{id:number, html_url:string, created_at:string, conclusion:string, aic:number}>} countedRuns
+ * @param {Array<{id:number, html_url:string, created_at:string, conclusion:string, aic:number, source?:string, accountingReason?:string}>} countedRuns
  * @param {{remaining:number,limit:number,used:number,reset:string} | null} rateLimit
  * @param {{candidateRunsCount:number,inspectedRunsCount:number,truncatedByRateLimit:boolean}} meta
  * @returns {string}
  */
 function renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, meta) {
   const stats = calculateDailyAICStats(countedRuns);
+  const estimatedAIC = countedRuns.reduce((sum, run) => sum + (run.source === "estimated" ? run.aic : 0), 0);
+  const confirmedZeroRuns = countedRuns.filter(run => run.accountingReason === "confirmed_zero").length;
   const remainingBudget = Math.max(0, threshold - stats.total);
   const usagePercent = threshold > 0 ? ((stats.total / threshold) * 100).toFixed(2) : "0.00";
   const runRows =
@@ -559,15 +605,18 @@ function renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns,
       ? countedRuns
           .slice()
           .sort((a, b) => Date.parse(b.created_at || "") - Date.parse(a.created_at || ""))
-          .map(run => `| [#${run.id}](${run.html_url || ""}) | ${escapeMarkdownCell(run.created_at || "")} | ${escapeMarkdownCell(run.conclusion || "unknown")} | ${formatAICCredits(run.aic)} |`)
+          .map(
+            run =>
+              `| [#${run.id}](${run.html_url || ""}) | ${escapeMarkdownCell(run.created_at || "")} | ${escapeMarkdownCell(run.conclusion || "unknown")} | ${formatAICCredits(run.aic) || "0"} | ${run.accountingReason === "confirmed_zero" ? "Confirmed zero (no AI jobs ran)" : run.source === "estimated" ? "Estimated" : "Recorded"} |`
+          )
           .join("\n")
-      : "| _none_ | — | — | 0 |";
+      : "| _none_ | — | — | 0 | — |";
 
   const noRunData = stats.count === 0;
   const totalAICFormatted = formatAICCredits(stats.total) || "0";
   const avgAICFormatted = noRunData ? "—" : formatAICCredits(stats.average) || "0";
   const stddevAICFormatted = noRunData ? "—" : formatAICCredits(stats.stddev) || "0";
-  const minMaxAICFormatted = noRunData ? "— / —" : `${formatAICCredits(stats.min)} / ${formatAICCredits(stats.max)}`;
+  const minMaxAICFormatted = noRunData ? "— / —" : `${formatAICCredits(stats.min) || "0"} / ${formatAICCredits(stats.max) || "0"}`;
 
   const noteLines = [];
   if (meta.truncatedByRateLimit && rateLimit) {
@@ -584,6 +633,9 @@ function renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns,
     "| Statistic | Value |",
     "| --- | ---: |",
     `| 24h total AIC | ${totalAICFormatted} |`,
+    `| Recorded AIC | ${formatAICCredits(stats.total - estimatedAIC) || "0"} |`,
+    `| Confirmed-zero runs (no AI jobs ran) | ${confirmedZeroRuns} |`,
+    `| Estimated AIC (unresolved accounting) | ${formatAICCredits(estimatedAIC) || "0"} |`,
     `| Threshold | ${formatAICCredits(threshold)} |`,
     `| Threshold used | ${usagePercent}% |`,
     `| Remaining headroom | ${formatAICCredits(remainingBudget) || "0"} |`,
@@ -595,9 +647,17 @@ function renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns,
     "",
     "Previous runs counted in the last 24 hours:",
     "",
-    "| Run | Created | Conclusion | AIC |",
-    "| --- | --- | --- | ---: |",
+    "| Run | Created | Conclusion | AIC | Source |",
+    "| --- | --- | --- | ---: | --- |",
     runRows,
+    "",
+    "Guardrail accounting is not provider billing; reconcile billing with the provider.",
+    ...(estimatedAIC > 0
+      ? [
+          "",
+          "Estimated credits are conservative per-run maximums, not measured consumption. Subsequent scans retry unresolved accounting; if it remains unavailable, estimates stop counting when their runs leave the rolling 24-hour window.",
+        ]
+      : []),
     ...(noteLines.length > 0 ? ["", ...noteLines] : []),
   ].join("\n");
 }
@@ -606,7 +666,7 @@ function renderDailyAICSummary(workflowName, actorLogin, threshold, countedRuns,
  * @param {string} workflowName
  * @param {string} actorLogin
  * @param {number} threshold
- * @param {Array<{id:number, html_url:string, created_at:string, conclusion:string, aic:number}>} countedRuns
+ * @param {Array<{id:number, html_url:string, created_at:string, conclusion:string, aic:number, source?:string, accountingReason?:string}>} countedRuns
  * @param {{remaining:number,limit:number,used:number,reset:string} | null} rateLimit
  * @param {{candidateRunsCount:number,inspectedRunsCount:number,truncatedByRateLimit:boolean}} meta
  * @returns {Promise<void>}
@@ -628,6 +688,7 @@ async function appendDailyAICSummary(workflowName, actorLogin, threshold, counte
 async function main(options = {}) {
   core.setOutput("daily_ai_credits_exceeded", "false");
   core.setOutput("daily_ai_credits_total", "");
+  core.setOutput("daily_ai_credits_estimated", "");
   core.setOutput("daily_ai_credits_threshold", "");
   core.setOutput("daily_ai_credits_guardrail_status", "not_run");
   core.setOutput("daily_ai_credits_guardrail_error", "");
@@ -650,31 +711,48 @@ async function main(options = {}) {
 
   const token = process.env.GH_AW_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
   const backend = dailyAICBackend();
-  if (!token && backend !== REPO_MEMORY_BACKEND) {
-    const message = "Daily workflow AI Credits are unknown: no artifact lookup token.";
-    core.setOutput("daily_ai_credits_guardrail_status", "structural_error");
-    core.setOutput("daily_ai_credits_guardrail_error", message);
-    core.setFailed(message);
-    return;
-  }
 
-  // API failures stop this scan; do not spend more quota on the next history run.
+  // Quota and permanent API failures stop the scan; transient historical reads
+  // may use conservative per-run estimates after bounded retries.
   try {
     const workflowName = process.env.GH_AW_WORKFLOW_NAME || process.env.GH_AW_WORKFLOW_ID || "workflow";
     let actorLogin = process.env.GITHUB_TRIGGERING_ACTOR || process.env.GITHUB_ACTOR || "";
+    const repository = `${context.repo.owner}/${context.repo.repo}`;
+    const workflowId = process.env.GH_AW_WORKFLOW_ID || workflowName;
+    const repoMemoryDir = options.repoMemoryDir || process.env.GH_AW_DAILY_AIC_REPO_MEMORY_DIR;
+    let useLedger = false;
     if (backend === REPO_MEMORY_BACKEND) {
-      if (process.env.GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC !== "true") {
-        const message = "Daily workflow AI Credits repo-memory ledger is untrusted; set GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC to true to explicitly allow it.";
+      const trustedLedger = process.env.GH_AW_DAILY_AIC_REPO_MEMORY_TRUSTED === "true";
+      const branchMissing = process.env.GH_AW_DAILY_AIC_REPO_MEMORY_BRANCH_MISSING === "true";
+      const allowInsecureLedger = process.env.GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC === "true";
+      if (!trustedLedger && !branchMissing && !allowInsecureLedger) {
+        const message = "Daily workflow AI Credits repo-memory ledger is untrusted; restore a trusted ledger branch or verify that the branch is absent before artifact-backed bootstrap.";
         core.setOutput("daily_ai_credits_guardrail_status", "structural_error");
         core.setOutput("daily_ai_credits_guardrail_error", message);
         core.setFailed(message);
         return;
       }
-      const repository = `${context.repo.owner}/${context.repo.repo}`;
+      const coverageStart = trustedLedger && !allowInsecureLedger ? readLedgerCoverageStart({ repoMemoryDir, repository, workflowId }) : null;
+      useLedger = allowInsecureLedger || (trustedLedger && coverageStart !== null && coverageStart <= Date.now() - WINDOW_MS);
+      if (!useLedger) {
+        logDailyGuardrail("Bootstrapping repo-memory AIC with authoritative artifact accounting", {
+          reason: branchMissing ? "branch_missing" : coverageStart === null ? "coverage_unavailable" : "coverage_warming",
+          requiredCoverageHours: 24,
+        });
+      }
+    }
+    if (!token && !useLedger) {
+      const message = "Daily workflow AI Credits are unknown: no artifact lookup token.";
+      core.setOutput("daily_ai_credits_guardrail_status", "structural_error");
+      core.setOutput("daily_ai_credits_guardrail_error", message);
+      core.setFailed(message);
+      return;
+    }
+    if (useLedger) {
       const countedRuns = readLedgerEntries({
-        repoMemoryDir: options.repoMemoryDir || process.env.GH_AW_DAILY_AIC_REPO_MEMORY_DIR,
+        repoMemoryDir,
         repository,
-        workflowId: process.env.GH_AW_WORKFLOW_ID || workflowName,
+        workflowId,
       }).map(entry => ({
         id: entry.run_id,
         html_url: entry.run_url || "",
@@ -682,7 +760,7 @@ async function main(options = {}) {
         conclusion: "completed",
         aic: entry.aic,
       }));
-      const totalAIC = countedRuns.reduce((sum, run) => sum + run.aic, 0);
+      const totalAIC = calculateDailyAICStats(countedRuns).total;
       const rateLimit = null;
       const summaryMeta = {
         candidateRunsCount: countedRuns.length,
@@ -690,6 +768,7 @@ async function main(options = {}) {
         truncatedByRateLimit: false,
       };
       core.setOutput("daily_ai_credits_total", String(totalAIC));
+      core.setOutput("daily_ai_credits_estimated", "0");
       core.setOutput("daily_ai_credits_threshold", String(threshold));
       logDailyGuardrail("Completed repo-memory AIC ledger read", {
         countedRuns: countedRuns.length,
@@ -711,7 +790,7 @@ async function main(options = {}) {
     }
     const githubClient = createRateLimitAwareGithub(github);
     const budget = createAPIBudget();
-    const artifactClient = await module.exports.getArtifactClient(budget.observe);
+    const artifactClient = await module.exports.getArtifactClient(undefined, budget.request);
     const { countedRuns, candidateRunsCount, cacheHits, current } = await scanDailyAIC({
       github: githubClient,
       context,
@@ -722,12 +801,16 @@ async function main(options = {}) {
       token,
       fallbackAIC: maxAICredits,
       cachePath: options.cachePath,
+      recovery: options.recovery,
     });
-    const totalAIC = countedRuns.reduce((sum, run) => sum + run.aic, 0);
+    const totalAIC = calculateDailyAICStats(countedRuns).total;
+    const estimatedAIC = countedRuns.reduce((sum, run) => sum + (run.source === "estimated" ? run.aic : 0), 0);
+    const confirmedZeroRuns = countedRuns.filter(run => run.accountingReason === "confirmed_zero").length;
     actorLogin = process.env.GITHUB_TRIGGERING_ACTOR || current.triggering_actor?.login || current.actor?.login || process.env.GITHUB_ACTOR || "";
     const rateLimit = budget.snapshot();
 
     core.setOutput("daily_ai_credits_total", String(totalAIC));
+    core.setOutput("daily_ai_credits_estimated", String(estimatedAIC));
     core.setOutput("daily_ai_credits_threshold", String(threshold));
 
     /** @type {{candidateRunsCount:number,inspectedRunsCount:number,truncatedByRateLimit:boolean}} */
@@ -767,14 +850,21 @@ async function main(options = {}) {
     // will skip the agent, and the conclusion job will handle reporting via the
     // daily_ai_credits_exceeded flag. Failing the activation job here causes the overall
     // workflow to fail even though hitting the daily limit is an expected, graceful outcome.
-    core.info(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
+    core.info(
+      `Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold} (measured AIC: ${totalAIC - estimatedAIC}, confirmed-zero runs: ${confirmedZeroRuns}, assumed AIC: ${estimatedAIC}). Guardrail accounting is not provider billing.`
+    );
   } catch (error) {
     const status = isStructuralGuardrailError(error) ? "structural_error" : "transient_error";
-    const message = `Daily workflow AI Credits are unknown: ${getErrorMessage(error)}`;
+    const readFailure = getAPIReadFailure(error);
+    const reason = readFailure
+      ? `${readFailure.operation} read stopped (${readFailure.status ? `HTTP ${readFailure.status}` : "transport or read error"}; attempts: ${readFailure.attempts}; reason: ${readFailure.reason}). Accounting remains unverified; agent startup is blocked.`
+      : getErrorMessage(error);
+    const diagnostic = getGitHubAPIDiagnostic(error);
+    const message = `Daily workflow AI Credits are unknown: ${reason}${diagnostic ? ` ${diagnostic.message}` : ""}`;
     core.setOutput("daily_ai_credits_guardrail_status", status);
     core.setOutput("daily_ai_credits_guardrail_error", message);
-    logDailyGuardrail("AIC inspection failed", { status, error: getErrorMessage(error) });
-    const retryAt = retryNotBefore(error?.response?.headers);
+    logDailyGuardrail("AIC inspection failed", { status, error: readFailure || getErrorMessage(error) });
+    const retryAt = retryNotBefore(error?.response?.headers, Date.now(), isQuotaError(error));
     if (retryAt) core.info(`Daily AIC inspection must not retry before ${retryAt}`);
     core.setFailed(message);
   }

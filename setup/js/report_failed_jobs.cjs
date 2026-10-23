@@ -1,6 +1,9 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { createReportIssue } = require("./issue_report.cjs");
+
+const { SAFE_OUTPUT_E001 } = require("./error_codes.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { fetchAndLogRateLimit } = require("./github_rate_limit_logger.cjs");
 const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
@@ -8,17 +11,44 @@ const { generateFooterWithExpiration, createExpirationLine } = require("./epheme
 const { generateXMLMarker } = require("./messages.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { redactBuiltInPatterns } = require("./redact_secrets.cjs");
 
 const GITHUB_API_VERSION = "2022-11-28";
 const FAILED_JOBS_ISSUE_EXPIRES_HOURS = 24 * 7; // 1 week
+const MAX_FAILED_STEP_NUMBER = 10000;
+const MAX_FAILED_STEPS_REPORTED = 10;
+const STATE_PUSH_JOB_IDS = new Set(["push_ledger_changes", "push_repo_memory", "push_evals_state", "push_experiment_state"]);
 
 /**
- * Known builtin job names whose failures are already reported
+ * Read error lines from an already-masked plain-text job log, not a workflow-log ZIP archive.
+ * @param {number} jobId
+ * @returns {Promise<string>}
+ */
+async function getStatePushError(jobId) {
+  try {
+    const response = await github.rest.actions.downloadJobLogsForWorkflowRun({ ...context.repo, job_id: jobId });
+    if (typeof response.data !== "string" && !(response.data instanceof ArrayBuffer) && !(response.data instanceof Uint8Array)) {
+      throw new TypeError(`${SAFE_OUTPUT_E001}: Unsupported state-push job log response`);
+    }
+    const log = typeof response.data === "string" ? response.data : Buffer.from(response.data instanceof ArrayBuffer ? new Uint8Array(response.data) : response.data).toString("utf8");
+    const errors = log.split(/\r?\n/).filter(line => /##\[error\]|fatal:|error:|remote: error:|!\s+\[rejected\]/i.test(line));
+    const detail = redactBuiltInPatterns(errors.slice(-20).join("\n"))
+      .content.replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@")
+      .replace(/(authorization:\s*(?:bearer|basic)\s+)\S+/gi, "$1[REDACTED]");
+    return sanitizeContent(detail, 4000).replace(/```/g, "``\u200b`");
+  } catch {
+    core.warning(`Could not retrieve error details for state-push job ${jobId}; see the job log`);
+    return "";
+  }
+}
+
+/**
+ * Stable builtin job IDs whose failures are already reported
  * by the handle_agent_failure step (the agent job) or are framework-internal
  * (conclusion = current job, pre_activation/activation = reported via agent failure issue flags,
  * safe-outputs/safe_outputs and detection = handled by dedicated conclusion reporting).
  */
-const BUILTIN_REPORTED_JOB_NAMES = new Set(["agent", "conclusion", "activation", "pre_activation", "pre-activation", "safe_outputs", "safe-outputs", "detection"]);
+const BUILTIN_REPORTED_JOB_IDS = new Set(["agent", "conclusion", "activation", "pre_activation", "pre-activation", "safe_outputs", "safe-outputs", "detection"]);
 
 /**
  * Check whether an error is a GitHub permission error for issues write.
@@ -44,34 +74,66 @@ function isActionsReadPermissionError(error) {
 
 /**
  * Format the list of failed jobs as a markdown bulleted list.
- * @param {Array<{name: string, html_url: string | null}>} jobs
+ * @param {Array<{name: string, html_url: string | null, error_detail?: string, failed_steps?: number[]}>} jobs
  * @returns {string}
  */
 function formatFailedJobsList(jobs) {
   return jobs
     .map(job => {
       const safeName = sanitizeContent(job.name);
+      const steps = job.failed_steps
+        ? `\n\n  Failed step numbers (up to ${MAX_FAILED_STEPS_REPORTED}): ${job.failed_steps.length ? job.failed_steps.map(number => `\`${number}\``).join(", ") : "unavailable"}. See the linked job for details.`
+        : "";
+      const detail = job.error_detail
+        ? `\n\n  \`\`\`text\n${job.error_detail
+            .split("\n")
+            .map(line => `  ${line}`)
+            .join("\n")}\n  \`\`\`\n`
+        : "";
       if (job.html_url && job.html_url.startsWith("https://")) {
         const safeUrl = sanitizeContent(job.html_url);
-        return `- [\`${safeName}\`](${safeUrl})`;
+        return `- [\`${safeName}\`](${safeUrl})${steps}${detail}`;
       }
-      return `- \`${safeName}\``;
+      return `- \`${safeName}\`${steps}${detail}`;
     })
     .join("\n");
 }
 
 /**
- * Query all jobs for the current workflow run and return failed non-builtin jobs.
- * @returns {Promise<Array<{name: string, html_url: string | null}>>}
+ * Filter failures by stable IDs from needs; use the jobs API only for display names and links.
+ * @returns {Promise<Array<{name: string, html_url: string | null, failed_steps?: number[]}>>}
  */
 async function getFailedNonBuiltinJobs() {
+  let jobResults;
+  let jobDisplayNames;
+  try {
+    jobResults = JSON.parse(process.env.GH_AW_JOB_RESULTS || "");
+    jobDisplayNames = JSON.parse(process.env.GH_AW_JOB_DISPLAY_NAMES || "");
+  } catch (error) {
+    throw new Error(`${SAFE_OUTPUT_E001}: Failed to parse failed-job reporting metadata: ${getErrorMessage(error)}`, { cause: error });
+  }
+  if (!jobResults || typeof jobResults !== "object" || Array.isArray(jobResults) || !jobDisplayNames || typeof jobDisplayNames !== "object" || Array.isArray(jobDisplayNames)) {
+    throw new Error("GH_AW_JOB_RESULTS and GH_AW_JOB_DISPLAY_NAMES must be JSON objects");
+  }
+  const failedJobIds = Object.keys(jobResults).filter(jobId => {
+    if (jobResults[jobId]?.result !== "failure") return false;
+    if (BUILTIN_REPORTED_JOB_IDS.has(jobId)) {
+      core.info(`Skipping builtin job ID: ${jobId} (handled by dedicated failure reporting)`);
+      return false;
+    }
+    return true;
+  });
+  if (failedJobIds.length === 0) return [];
+
   const { owner, repo } = context.repo;
   const runId = context.runId;
 
   core.info(`Querying jobs for workflow run ${runId}`);
 
-  /** @type {Array<{name: string, html_url: string | null}>} */
-  const failedJobs = [];
+  /** @type {Array<{name: string, html_url: string | null, id?: number, error_detail?: string, failed_steps?: number[]}>} */
+  const runJobs = [];
+  /** @type {import("./workflow_job_durations.cjs").JobTiming[]} */
+  const timingJobs = [];
 
   let page = 1;
   const perPage = 100;
@@ -87,18 +149,19 @@ async function getFailedNonBuiltinJobs() {
     });
 
     const jobs = response.data.jobs;
+    timingJobs.push(...jobs);
     core.info(`Page ${page}: retrieved ${jobs.length} jobs`);
 
     for (const job of jobs) {
       if (job.conclusion !== "failure") {
         continue;
       }
-      if (BUILTIN_REPORTED_JOB_NAMES.has(job.name)) {
-        core.info(`Skipping builtin job: ${job.name} (already reported by agent failure handler)`);
-        continue;
-      }
-      core.info(`Found failed non-builtin job: ${job.name}`);
-      failedJobs.push({ name: job.name, html_url: job.html_url });
+      // Step names can contain interpolated inputs; retain only bounded numeric metadata.
+      const failedStepNumbers = Array.isArray(job.steps)
+        ? job.steps.filter(step => step?.conclusion === "failure" && Number.isSafeInteger(step.number) && step.number > 0 && step.number <= MAX_FAILED_STEP_NUMBER).map(step => step.number)
+        : undefined;
+      const failedSteps = failedStepNumbers ? [...new Set(failedStepNumbers)].slice(0, MAX_FAILED_STEPS_REPORTED) : undefined;
+      runJobs.push({ name: job.name, html_url: job.html_url, ...(job.id ? { id: job.id } : {}), ...(failedSteps ? { failed_steps: failedSteps } : {}) });
     }
 
     if (jobs.length < perPage) {
@@ -107,6 +170,27 @@ async function getFailedNonBuiltinJobs() {
     page++;
   }
 
+  const { collectJobDurations } = require("./workflow_job_durations.cjs");
+  const durations = await collectJobDurations({ jobs: timingJobs, warn: message => core.warning(message) });
+  core.setOutput("job_durations", JSON.stringify(durations));
+
+  const matchesName = (name, display) => name === display || name.startsWith(`${display} (`) || name.startsWith(`${display} / `);
+  const knownIds = new Set([...Object.keys(jobResults), ...Object.keys(jobDisplayNames)]);
+  const failedJobs = [];
+  for (const jobId of failedJobIds) {
+    const displayName = jobDisplayNames[jobId] || jobId;
+    const matchingJobs = runJobs.filter(job => matchesName(job.name, displayName));
+    const ambiguousName = [...knownIds].some(otherId => otherId !== jobId && matchingJobs.some(job => matchesName(job.name, jobDisplayNames[otherId] || otherId)));
+    if (matchingJobs.length > 0 && !ambiguousName) {
+      for (const job of matchingJobs) {
+        const detail = STATE_PUSH_JOB_IDS.has(jobId) && job.id ? await getStatePushError(job.id) : "";
+        failedJobs.push({ name: job.name, html_url: job.html_url, ...(job.failed_steps ? { failed_steps: job.failed_steps } : {}), ...(detail ? { error_detail: detail } : {}) });
+      }
+      continue;
+    }
+    core.warning(`Could not uniquely match failed job ID ${jobId} to its API display name; linking to the workflow run`);
+    failedJobs.push({ name: jobId, html_url: process.env.GH_AW_RUN_URL || null });
+  }
   return failedJobs;
 }
 
@@ -178,7 +262,7 @@ async function main() {
     core.info(`Creating failed jobs issue: "${issueTitle}"`);
 
     try {
-      const newIssue = await github.rest.issues.create({
+      const newIssue = await createReportIssue(github, {
         owner,
         repo,
         title: issueTitle,
@@ -200,4 +284,4 @@ async function main() {
   }
 }
 
-module.exports = { main, getFailedNonBuiltinJobs, formatFailedJobsList, BUILTIN_REPORTED_JOB_NAMES };
+module.exports = { main, getFailedNonBuiltinJobs, formatFailedJobsList, BUILTIN_REPORTED_JOB_IDS };

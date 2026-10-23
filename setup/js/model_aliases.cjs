@@ -36,9 +36,7 @@ function reduceModelNameToIdentifier(modelName) {
    * @param {string} family - Fixed alphanumeric family name from the table below
    * @returns {RegExp}
    */
-  const buildFamilyVersionPattern = family =>
-    // eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- VERSION_SUFFIX_PATTERN is an intentional regex fragment and `family` is a fixed alphanumeric literal
-    new RegExp(`${family}${VERSION_SUFFIX_PATTERN}`);
+  const buildFamilyVersionPattern = family => new RegExp(`${family.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}${VERSION_SUFFIX_PATTERN}`);
 
   /** @type {Array<{ familyPattern: RegExp, versionPattern: RegExp, prefix: string }>} */
   const shortcuts = [
@@ -60,8 +58,8 @@ function reduceModelNameToIdentifier(modelName) {
 }
 
 /**
- * Strip a provider prefix from a model name (e.g. "copilot/mai-code-1-flash-picker"
- * becomes "mai-code-1-flash-picker") so the identifier reflects the model, not the provider.
+ * Strip a provider prefix from a model name (e.g. "copilot/mai-code-1.1-flash"
+ * becomes "mai-code-1.1-flash") so the identifier reflects the model, not the provider.
  *
  * @param {string} normalizedModelName
  * @returns {string}

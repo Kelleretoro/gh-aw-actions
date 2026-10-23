@@ -7,13 +7,14 @@
 // allowlist check is required in this handler.
 
 const fs = require("fs");
+const { scopedArtifactFilename } = require("./work_queue_claim_scope.cjs");
 const os = require("os");
 const path = require("path");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { generateGitPatch } = require("./generate_git_patch.cjs");
 const { ensureOriginRemoteTrackingRef, execGitSync } = require("./git_helpers.cjs");
-const { isAncestorCommit, describeGitFailure } = require("./git_patch_utils.cjs");
+const { isAncestorCommit, describeGitFailure, sanitizeBranchNameForPatch } = require("./git_patch_utils.cjs");
 const { normalizeCommitSHA } = require("./commit_sha_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
 
@@ -50,7 +51,7 @@ function sanitizeForFilename(value, fallback) {
  * @returns {string} The sanitized branch name safe for use in a filename
  */
 function sanitizeBranchNameForBundle(branchName) {
-  return sanitizeForFilename(branchName, "unknown");
+  return sanitizeBranchNameForPatch(branchName);
 }
 
 /**
@@ -60,7 +61,7 @@ function sanitizeBranchNameForBundle(branchName) {
  */
 function getBundlePathForBranch(branchName) {
   const sanitized = sanitizeBranchNameForBundle(branchName);
-  return `/tmp/gh-aw/aw-${sanitized}.bundle`;
+  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitized}.bundle`);
 }
 
 /**
@@ -82,7 +83,7 @@ function sanitizeRepoSlugForBundle(repoSlug) {
 function getBundlePathForBranchInRepo(branchName, repoSlug) {
   const sanitizedBranch = sanitizeBranchNameForBundle(branchName);
   const sanitizedRepo = sanitizeRepoSlugForBundle(repoSlug);
-  return `/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.bundle`;
+  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.bundle`);
 }
 
 /**

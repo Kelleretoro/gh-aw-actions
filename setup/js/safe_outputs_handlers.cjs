@@ -15,24 +15,78 @@ const { lookupCheckout } = require("./checkout_manifest.cjs");
 const { generateGitPatch } = require("./generate_git_patch.cjs");
 const { generateGitBundle } = require("./generate_git_bundle.cjs");
 const { hasMergeCommitsInRange, execGitSync, ensureSafeDirectoryTrust } = require("./git_helpers.cjs");
-const { enforceCommentLimits } = require("./comment_limit_helpers.cjs");
+const { enforceCommentLimits, MAX_COMMENT_INPUT_LENGTH } = require("./comment_limit_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_PARSE, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
-const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
+const { resolveTargetRepoConfig, resolveAndValidateRepo, isSideRepoTarget, patchWorkspaceTargetsRepo } = require("./repo_helpers.cjs");
 const { generateTemporaryId, getOrGenerateTemporaryId } = require("./temporary_id.cjs");
 const { parseAllowedExtensionsEnv } = require("./allowed_extensions_helpers.cjs");
 const { getStagedPatchDiffSizeBytes } = require("./git_patch_utils.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
 const { parseDeduplicateByTitle, normalizeTitleForDedup, findDuplicateByTitle } = require("./issue_title_dedup.cjs");
-const { validateCreatePullRequestIntent, validatePushToPullRequestBranchIntent, validateCreateIssueIntent, validateAddCommentIntent } = require("./intent_probe.cjs");
+const { isProbingNoopMessage, validateCreatePullRequestIntent, validatePushToPullRequestBranchIntent, validateCreateIssueIntent, validateAddCommentIntent } = require("./intent_probe.cjs");
 const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { lstatGuard } = require("./symlink_guard.cjs");
-const { validateValueAgainstSchema } = require("./mcp_scripts_validation.cjs");
+const { validateValueAgainstSchema } = require("./schema-validation.cjs");
 const { resolveDataSchema } = require("./data_schema_normalizer.cjs");
+const { normalizeBlankOptionalFields } = require("./optional_field_normalizer.cjs");
 const { clearValidationMarker, formatJSONFiles, runCustomMemoryValidation, writeValidationMarker } = require("./memory_custom_validation.cjs");
-const { filterIneligibleMemoryFiles } = require("./memory_file_eligibility.cjs");
+const { compileFileGlobPatterns, isMemoryFileEligible } = require("./memory_file_eligibility.cjs");
+const { normalizeRuntimeMessage, readClaimScopeContext, withClaimExecution, currentClaimHandle, claimArtifactPath } = require("./work_queue_claim_scope.cjs");
+
+function createEligibleMemoryValidationView(memoryDir, isEligibleFile) {
+  let validationDir;
+  try {
+    validationDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-repo-memory-validation-"));
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Failed to create repo-memory validation directory: ${getErrorMessage(error)}`, { cause: error });
+  }
+
+  /**
+   * @param {string} targetPath
+   */
+  function removeValidationDirectory(targetPath) {
+    try {
+      fs.rmSync(targetPath, { recursive: true, force: true });
+    } catch (error) {
+      throw new Error(`${ERR_SYSTEM}: Failed to remove repo-memory validation directory: ${getErrorMessage(error)}`, { cause: error });
+    }
+  }
+
+  try {
+    /**
+     * @param {string} sourceDir
+     * @param {string} relativePath
+     */
+    function copyEligibleFiles(sourceDir, relativePath) {
+      for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+        const sourcePath = path.join(sourceDir, entry.name);
+        const relativeFilePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
+        if (entry.isDirectory()) {
+          if (entry.name !== ".git") {
+            copyEligibleFiles(sourcePath, relativeFilePath);
+          }
+        } else if (entry.isFile() && isEligibleFile(relativeFilePath)) {
+          const targetPath = path.join(validationDir, relativeFilePath);
+          fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+          fs.copyFileSync(sourcePath, targetPath);
+        }
+      }
+    }
+
+    copyEligibleFiles(memoryDir, "");
+    return validationDir;
+  } catch (error) {
+    try {
+      removeValidationDirectory(validationDir);
+    } catch (cleanupError) {
+      throw new Error(`${ERR_SYSTEM}: Failed to create repo-memory validation view: ${getErrorMessage(error)}; cleanup also failed: ${getErrorMessage(cleanupError)}`, { cause: error });
+    }
+    throw error;
+  }
+}
 
 /** PR event names used for target:triggering context validation across all safe-output handlers. */
 const PR_EVENT_NAMES = new Set(["pull_request", "pull_request_target", "pull_request_review", "pull_request_review_comment"]);
@@ -103,6 +157,7 @@ function readJSONFile(filePath) {
 const safeOutputsTools = readJSONFile(path.join(__dirname, "safe_outputs_tools.json"));
 
 const safeOutputsToolMap = new Map(safeOutputsTools.map(tool => [tool.name.replace(/-/g, "_"), tool]));
+const { validateOperation } = require("./ledger_builtin.cjs");
 
 /**
  * @param {string} error
@@ -386,6 +441,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const operationCounts = new Map();
   const uploadedAssetPaths = new Set();
+  const scopedKey = value => JSON.stringify([currentClaimHandle() || null, value]);
 
   /**
    * Return the explicitly user-configured max for a safe-output type, or null if not set / unlimited.
@@ -419,7 +475,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
   function enforcePerTypeMax(type) {
     const maxAllowed = getExplicitMax(type);
     if (maxAllowed === null) return; // no explicit limit configured
-    const current = operationCounts.get(type) || 0;
+    const current = operationCounts.get(scopedKey(type)) || 0;
     if (current >= maxAllowed) {
       throw {
         code: -32602,
@@ -447,11 +503,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * Per Safe Outputs Specification MCE4: invocation-time half of dual enforcement.
    * @param {Record<string, any>} entry
    */
+  /**
+   * Probing entries are schema probes (e.g. `noop` with message "test") rather than a
+   * genuine signal. They are ignored entirely: not recorded, not counted against the
+   * type budget, so a probe never crowds out or short-circuits the real signal.
+   * @param {Record<string, any>} entry
+   * @returns {boolean}
+   */
+  const isIgnoredProbingEntry = entry => entry?.type === "noop" && isProbingNoopMessage(entry?.message);
+
   const appendSafeOutputCounted = entry => {
+    if (isIgnoredProbingEntry(entry)) {
+      server.debug(`Ignoring probing noop call (not recorded, does not consume the noop budget): ${JSON.stringify(entry?.message)}`);
+      return;
+    }
     const type = entry?.type;
     if (type) enforcePerTypeMax(type);
     appendSafeOutput(entry);
-    if (type) operationCounts.set(type, (operationCounts.get(type) || 0) + 1);
+    if (type) operationCounts.set(scopedKey(type), (operationCounts.get(scopedKey(type)) || 0) + 1);
   };
 
   /**
@@ -581,6 +650,32 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     };
   };
 
+  const ledgerBuiltinHandler = (ledgerType, operation) => args => {
+    const ledgers = config.ledger_append?.ledgers || [];
+    const candidates = ledgers.filter(ledger => ledger.type === ledgerType);
+    const target = args?.ledger === undefined && candidates.length === 1 ? candidates[0] : candidates.find(ledger => ledger.name === args?.ledger);
+    if (!target) return buildIntentErrorResponse("Specify a configured ledger of the correct built-in type.");
+    const { ledger: _ledger, temp_id, ...fields } = args || {};
+    const claimHandle = currentClaimHandle();
+    if (claimHandle) {
+      for (const field of ["claim_handle", "claim_id", "work_id"]) delete fields[field];
+    }
+    if (Object.hasOwn(fields, "operation")) return buildIntentErrorResponse("Invalid built-in ledger operation arguments.");
+    const record = { operation, ...fields };
+    try {
+      validateOperation(record, target);
+    } catch {
+      return buildIntentErrorResponse("Invalid built-in ledger operation arguments.");
+    }
+    return defaultHandler("ledger_append")({ ledger: target.name, ...(temp_id !== undefined && { temp_id }), ...(claimHandle ? { claim_handle: claimHandle } : {}), ...record });
+  };
+  const ledgerAgentAppendHandler = args => {
+    const ledgers = config.ledger_append?.ledgers || [];
+    const target = ledgers.find(ledger => ledger.name === args?.ledger) || (args?.ledger === undefined && ledgers.length === 1 ? ledgers[0] : null);
+    if (target?.type === "notes") return buildIntentErrorResponse("Use ledger_note_add or ledger_note_vote for notes ledgers.");
+    return defaultHandler("ledger_append")(args);
+  };
+
   const createIssueConfig = config.create_issue || {};
   let deduplicateByTitle = { enabled: false, maxDistance: 0 };
   try {
@@ -616,7 +711,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     if (!isInWorkspace && !isInTmp) {
       throw new Error(`${ERR_CONFIG}: File path must be within workspace directory (${workspaceDir}) or /tmp directory. ` + `Provided path: ${filePath} (resolved to: ${absolutePath})`);
     }
-    if (uploadedAssetPaths.has(absolutePath)) {
+    if (uploadedAssetPaths.has(scopedKey(absolutePath))) {
       throw new Error(`${ERR_VALIDATION}: Duplicate upload_asset source path is not allowed: ${filePath}`);
     }
 
@@ -662,7 +757,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // Create assets directory
     // Use RUNNER_TEMP so the staged files land on the host filesystem (shared with
     // the artifact-upload step), matching the same pattern used by upload_artifact.
-    const assetsDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "assets");
+    const assetsRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "assets");
+    const assetsDir = currentClaimHandle() ? claimArtifactPath(assetsRoot, currentClaimHandle()) : assetsRoot;
     if (!fs.existsSync(assetsDir)) {
       try {
         fs.mkdirSync(assetsDir, { recursive: true });
@@ -695,21 +791,22 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
 
     // Generate target filename as sha + extension (lowercased)
-    const targetFileName = (sha + fileExt).toLowerCase();
+    const targetFileName = currentClaimHandle() ? `claims/${path.basename(claimArtifactPath("", currentClaimHandle()))}/${sha}${fileExt}` : (sha + fileExt).toLowerCase();
 
     const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
     const repo = process.env.GITHUB_REPOSITORY || "owner/repo";
+    const assetBranch = currentClaimHandle() ? `${normalizedBranchName}/claims/${path.basename(claimArtifactPath("", currentClaimHandle()))}` : normalizedBranchName;
     let url;
     try {
       const serverHostname = new URL(githubServer).hostname;
       if (serverHostname === "github.com") {
-        url = `https://github.com/${repo}/blob/${normalizedBranchName}/${targetFileName}?raw=true`;
+        url = `https://github.com/${repo}/blob/${assetBranch}/${targetFileName}?raw=true`;
       } else {
         // GitHub Enterprise Server - raw content is served from the same host with /raw/ path
-        url = `${githubServer}/${repo}/raw/${normalizedBranchName}/${targetFileName}`;
+        url = `${githubServer}/${repo}/raw/${assetBranch}/${targetFileName}`;
       }
     } catch {
-      url = `${githubServer}/${repo}/raw/${normalizedBranchName}/${targetFileName}`;
+      url = `${githubServer}/${repo}/raw/${assetBranch}/${targetFileName}`;
     }
 
     // Create entry for safe outputs
@@ -724,7 +821,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     };
 
     appendSafeOutputCounted(entry);
-    uploadedAssetPaths.add(absolutePath);
+    uploadedAssetPaths.add(scopedKey(absolutePath));
 
     return {
       content: [
@@ -792,7 +889,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     let repoSlug = null;
     const patchWorkspacePath = typeof prConfig.patch_workspace_path === "string" ? prConfig.patch_workspace_path.trim() : "";
     const currentCheckoutRepo = typeof prConfig.current_checkout_repo === "string" ? prConfig.current_checkout_repo.trim() : "";
-    const patchWorkspaceMatchesTargetRepo = patchWorkspacePath && (!currentCheckoutRepo || currentCheckoutRepo === repoResult.repo);
+    const patchWorkspaceMatchesTargetRepo = patchWorkspacePath && patchWorkspaceTargetsRepo(repoResult.repo, currentCheckoutRepo);
 
     if (patchWorkspaceMatchesTargetRepo) {
       const patchWorkspaceResult = resolvePatchWorkspacePath(patchWorkspacePath);
@@ -815,7 +912,13 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       server.debug(`Using configured patch_workspace_path for create_pull_request: ${patchWorkspacePath} -> ${repoCwd}`);
     }
 
-    if (((entry.repo && entry.repo.trim()) || prConfig["target-repo"]) && !repoCwd) {
+    const targetIsSideRepo = isSideRepoTarget(repoResult.repo);
+    if (targetIsSideRepo) {
+      server.debug(`create_pull_request: resolved target ${repoResult.repo} differs from workflow repository; requiring its checkout`);
+    } else {
+      server.debug("create_pull_request: resolved target matches workflow repository; no cross-repo checkout needed");
+    }
+    if (targetIsSideRepo && !repoCwd) {
       // Use the validated/qualified repo slug from repoResult to avoid divergence
       // between the raw user input and the normalized/qualified repo name
       repoSlug = repoResult.repo;
@@ -870,6 +973,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // This makes the safe output "self-describing" and fixes checkout for events
     // like issue_comment on PRs targeting non-default branches.
     entry.base_branch = baseBranch;
+    server.debug(`create_pull_request: patch context repo=${repoResult.repo}, cwd=${repoCwd || process.env.GITHUB_WORKSPACE || process.cwd()}, baseBranch=${baseBranch}`);
 
     // If branch is not provided, is empty, or equals the base branch, use the current branch from git
     // This handles cases where the agent incorrectly passes the base branch instead of the working branch
@@ -921,6 +1025,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
+    if (!normalizeBranchName(entry.branch)) {
+      return buildIntentErrorResponse("Invalid branch name: provide a name containing more than dashes.");
+    }
     const intentValidationError = validateCreatePullRequestIntent(entry);
     if (intentValidationError) {
       return buildIntentErrorResponse(intentValidationError);
@@ -972,12 +1079,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     const useBundle = patchFormat === "bundle";
 
     // Build common options for both patch and bundle generation
-    const transportOptions = {};
+    const transportOptions = { repoSlug: repoResult.repo };
     if (repoCwd) {
       transportOptions.cwd = repoCwd;
-    }
-    if (repoSlug) {
-      transportOptions.repoSlug = repoSlug;
     }
     // Pass per-handler token so cross-repo PATs are used for git fetch when configured.
     // Falls back to GITHUB_TOKEN if not set.
@@ -1235,7 +1339,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     const itemRepo = repoResult.repo;
     const pushPatchWorkspacePath = typeof pushConfig.patch_workspace_path === "string" ? pushConfig.patch_workspace_path.trim() : "";
     const pushCurrentCheckoutRepo = typeof pushConfig.current_checkout_repo === "string" ? pushConfig.current_checkout_repo.trim() : "";
-    const pushPatchWorkspaceMatchesTargetRepo = pushPatchWorkspacePath && (!pushCurrentCheckoutRepo || pushCurrentCheckoutRepo === itemRepo);
+    const pushPatchWorkspaceMatchesTargetRepo = pushPatchWorkspacePath && patchWorkspaceTargetsRepo(itemRepo, pushCurrentCheckoutRepo);
 
     if (pushPatchWorkspaceMatchesTargetRepo) {
       const patchWorkspaceResult = resolvePatchWorkspacePath(pushPatchWorkspacePath);
@@ -1258,14 +1362,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       server.debug(`Using configured patch_workspace_path for push_to_pull_request_branch: ${pushPatchWorkspacePath} -> ${repoCwd}`);
     }
 
-    const envTargetSlug = (process.env.GH_AW_TARGET_REPO_SLUG || "").trim();
-    const currentRepo = (process.env.GITHUB_REPOSITORY || "").toLowerCase();
-    const envSlugIsSideRepo = envTargetSlug && envTargetSlug.toLowerCase() !== currentRepo;
-    if (envTargetSlug && !envSlugIsSideRepo) {
-      server.debug(`GH_AW_TARGET_REPO_SLUG (${envTargetSlug}) matches current repo; not using as side-repo checkout hint for push_to_pull_request_branch`);
-    }
-    const hasExplicitTargetRepoHint = (entry.repo && entry.repo.trim()) || pushConfig["target-repo"] || envSlugIsSideRepo;
-    if (hasExplicitTargetRepoHint && !repoCwd) {
+    const targetIsSideRepo = isSideRepoTarget(itemRepo);
+    if (targetIsSideRepo && !repoCwd) {
       server.debug(`Looking for checkout of target repo: ${itemRepo}`);
       const checkoutResult = findRepoCheckout(itemRepo);
       if (!checkoutResult.success) {
@@ -1371,6 +1469,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
+    if (!normalizeBranchName(entry.branch)) {
+      return buildIntentErrorResponse("Invalid branch name: provide a name containing more than dashes.");
+    }
     const intentValidationError = validatePushToPullRequestBranchIntent(entry);
     if (intentValidationError) {
       return buildIntentErrorResponse(intentValidationError);
@@ -1387,6 +1488,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
 
     const prHeadBaseline = resolvePRHeadBaselineForPush(entry.branch, itemRepo, effectivePushPRNumber, server);
+    const incrementalBaseRef = prHeadBaseline?.sha || prHeadBaseline?.ref || `refs/remotes/origin/${entry.branch}`;
     if (prHeadBaseline?.headRepo && prHeadBaseline.headRepo.toLowerCase() !== itemRepo.toLowerCase() && prHeadBaseline.headRepo.toLowerCase() !== configuredHeadRepo.toLowerCase()) {
       return {
         content: [
@@ -1403,7 +1505,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
 
     // Build common options for both patch and bundle generation
-    const pushTransportOptions = { mode: "incremental" };
+    const pushTransportOptions = { mode: "incremental", repoSlug: repoResult.repo };
     if (prHeadBaseline) {
       if (prHeadBaseline.ref) {
         pushTransportOptions.incrementalBaseRef = prHeadBaseline.ref;
@@ -1414,7 +1516,6 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     }
     if (repoCwd) {
       pushTransportOptions.cwd = repoCwd;
-      pushTransportOptions.repoSlug = repoResult.repo;
     }
     // Pass per-handler token so cross-repo PATs are used for git fetch when configured.
     // Falls back to GITHUB_TOKEN if not set.
@@ -1459,10 +1560,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // only local refs (no extra fetch); a detection miss simply preserves the
     // existing behavior.
     if (!useBundle && !patchFormatExplicit && entry.branch) {
-      const rangeBaseRef = prHeadBaseline?.sha || prHeadBaseline?.ref || `refs/remotes/origin/${entry.branch}`;
-      const hasMerges = hasMergeCommitsInRange(rangeBaseRef, entry.branch, { cwd: repoCwd || undefined });
+      const hasMerges = hasMergeCommitsInRange(incrementalBaseRef, entry.branch, { cwd: repoCwd || undefined });
       if (hasMerges) {
-        server.debug(`push_to_pull_request_branch: detected merge commit(s) in incremental range ${rangeBaseRef}..${entry.branch}; auto-switching to bundle transport (set patch-format: am to override).`);
+        server.debug(`push_to_pull_request_branch: detected merge commit(s) in incremental range ${incrementalBaseRef}..${entry.branch}; auto-switching to bundle transport (set patch-format: am to override).`);
         useBundle = true;
       }
     }
@@ -1498,49 +1598,42 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       pushPinnedSha = null;
     }
 
-    // Full-branch allowed_files check: validate that ALL commits on the PR branch
-    // (relative to origin/baseBranch) only touch files permitted by allowed_files.
-    // The incremental patch check at apply-time only inspects the net diff between
-    // origin/<branch> and the local branch tip; this catches disallowed files that
-    // appear in earlier commits on the branch (e.g. a Copilot branch that also
-    // modified .github/workflows/**) and returns an actionable error to the agent
-    // before any transport artifacts are generated.
+    // Validate the commits added after the existing PR head, not author-owned
+    // commits already on the branch. Inspect each commit rather than only the net
+    // diff so a disallowed file changed and reverted by the agent is still caught.
     if (Array.isArray(pushConfig.allowed_files) && pushConfig.allowed_files.length > 0) {
       try {
-        // Use the pinned SHA as the range head to avoid any TOCTOU window between
-        // the time the SHA was recorded and the time of the git log query.  If no
-        // pinned SHA is available (e.g. non-bundle path), skip the check so we do
-        // not race against a mutable ref; the apply-time check still enforces policy.
+        // Use the pinned SHA to avoid racing a mutable local branch ref.
         if (!pushPinnedSha) {
-          server.debug("Full-branch allowed-files check skipped: branch SHA not pinned (non-bundle path)");
+          server.debug("Incremental allowed-files check skipped: branch SHA not pinned (non-bundle path)");
         } else {
-          const branchHistoryFiles = execGitSync(["log", "--name-only", "--pretty=format:", `origin/${baseBranch}..${pushPinnedSha}`, "--"], { cwd: pushGitCwd })
+          const agentFiles = execGitSync(["log", "--ancestry-path", "--name-only", "--pretty=format:", `${incrementalBaseRef}..${pushPinnedSha}`, "--"], { cwd: pushGitCwd })
             .toString()
             .split("\n")
             .map(s => s.trim())
             .filter(Boolean);
 
-          if (branchHistoryFiles.length > 0) {
+          if (agentFiles.length > 0) {
             const allowedPatterns = pushConfig.allowed_files.map(p => globPatternToRegex(p));
             // Files matching excluded_files are intentionally exempt: they will be stripped
             // from the patch at generation time via :(exclude) pathspecs, so they won't be
             // present in the final changeset applied to the branch.
             const excludedPatterns = Array.isArray(pushConfig.excluded_files) ? pushConfig.excluded_files.map(p => globPatternToRegex(p)) : [];
-            const uniqueFiles = [...new Set(branchHistoryFiles)];
+            const uniqueFiles = [...new Set(agentFiles)];
             const disallowedFiles = uniqueFiles.filter(f => !allowedPatterns.some(re => re.test(f)) && !excludedPatterns.some(re => re.test(f)));
 
             if (disallowedFiles.length > 0) {
               const sample = disallowedFiles.slice(0, 5);
               const remaining = disallowedFiles.length - sample.length;
               const filesStr = remaining > 0 ? `${sample.join(", ")} (+${remaining} more)` : sample.join(", ");
-              server.debug(`Full-branch allowed-files check failed: ${filesStr}`);
+              server.debug(`Incremental allowed-files check failed: ${filesStr}`);
               return {
                 content: [
                   {
                     type: "text",
                     text: JSON.stringify({
                       result: "error",
-                      error: `Cannot push to pull request branch: the branch '${entry.branch}' history contains commits that modify files outside the allowed-files configuration: ${filesStr}. Remove the disallowed file changes from your commits and retry, or update the allowed-files configuration to include these files.`,
+                      error: `Cannot push to pull request branch: the agent commits on '${entry.branch}' modify files outside the allowed-files configuration: ${filesStr}. Remove the disallowed file changes from your commits and retry, or update the allowed-files configuration to include these files.`,
                       disallowed_files: disallowedFiles,
                     }),
                   },
@@ -1550,12 +1643,12 @@ function createHandlers(server, appendSafeOutput, config = {}) {
             }
           }
         }
-      } catch (fullBranchCheckError) {
-        // Non-fatal: if origin/baseBranch is not available locally or git fails,
-        // skip the full-branch check and continue.  The apply-time policy check in
+      } catch (incrementalCheckError) {
+        // Non-fatal: if the PR head is not available locally or git fails,
+        // skip this check and continue. The apply-time policy check in
         // push_to_pull_request_branch.cjs will still enforce allowed_files against
         // the incremental patch content.
-        server.debug(`Full-branch allowed-files check skipped (non-fatal): ${getErrorMessage(fullBranchCheckError)}`);
+        server.debug(`Incremental allowed-files check skipped (non-fatal): ${getErrorMessage(incrementalCheckError)}`);
       }
     }
 
@@ -1787,13 +1880,37 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     const allowedExtensions = Array.isArray(memoryConf.allowed_extensions) ? memoryConf.allowed_extensions : [];
     const fileGlobFilter = typeof memoryConf.file_glob === "string" ? memoryConf.file_glob : "";
     const validationConfig = memoryConf.validation || null;
-    const validationScript = validationConfig && typeof validationConfig.script === "string" ? validationConfig.script : "";
+    const hasValidationScript = validationConfig && Object.prototype.hasOwnProperty.call(validationConfig, "script");
+    const hasJSONSchemas = validationConfig && Object.prototype.hasOwnProperty.call(validationConfig, "json_schemas");
+    const scriptRequired = validationConfig?.script_required === true;
+    const schemasRequired = validationConfig?.json_schemas_required === true;
+    const validationScript = hasValidationScript && typeof validationConfig.script === "string" ? validationConfig.script : "";
+    const jsonSchemas = hasJSONSchemas ? validationConfig.json_schemas : undefined;
     const validationTimeoutSeconds = validationConfig && Number.isFinite(validationConfig.timeout) ? validationConfig.timeout : undefined;
     // The effective limit is max_patch_size × 1.2, matching the push gate in push_repo_memory.cjs.
     // This catches cases where total memory content is close to or exceeds the push diff limit.
     const effectiveMaxPatchSize = Math.floor(maxPatchSize * 1.2);
 
+    if (validationConfig && (typeof validationConfig !== "object" || Array.isArray(validationConfig))) {
+      return buildIntentErrorResponse(`Repo-memory validation configuration for '${memoryId}' is malformed.`);
+    }
+    if (hasValidationScript && (typeof validationConfig.script !== "string" || !validationConfig.script)) {
+      return buildIntentErrorResponse(`Repo-memory validation script configuration for '${memoryId}' is malformed.`);
+    }
+    if (scriptRequired && !hasValidationScript) {
+      return buildIntentErrorResponse(`Repo-memory validation script configuration for '${memoryId}' is missing.`);
+    }
     if (!fs.existsSync(memoryDir)) {
+      if (hasJSONSchemas || schemasRequired) {
+        const missingFileValidation = runCustomMemoryValidation({
+          jsonSchemas,
+          requireJSONSchemas: true,
+          memoryDir,
+          memoryId,
+          kind: "repo",
+        });
+        return buildIntentErrorResponse(`Repo-memory schema validation failed for '${memoryId}': ${missingFileValidation.stderr}`);
+      }
       return {
         content: [
           {
@@ -1804,22 +1921,16 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
-    // Allowed-extensions and file-glob are persistence filters: ineligible files must be
-    // removed here too, before formatting/scanning/staging/custom-validation, so this
-    // preflight sees the same effective file set as the later filter/upload/push steps
-    // and never hard-fails on a file that would have been silently dropped downstream.
-    if (allowedExtensions.length > 0 || fileGlobFilter) {
-      const { removed } = filterIneligibleMemoryFiles(memoryDir, allowedExtensions, fileGlobFilter, core);
-      if (removed.length > 0) {
-        core.info(`push_repo_memory: ignored ${removed.length} ineligible file(s) before validation`);
-      }
-    }
+    // Persistence filters apply to validation and staging, but validation must
+    // not delete files from the agent's working directory.
+    const { compiledPatterns } = compileFileGlobPatterns(fileGlobFilter);
+    const isEligibleFile = relativePath => isMemoryFileEligible(relativePath, allowedExtensions, compiledPatterns).eligible;
 
     clearValidationMarker("repo", memoryId);
 
     if (memoryConf.format_json === true) {
       try {
-        const formattedFiles = formatJSONFiles(memoryDir, maxFileSize);
+        const formattedFiles = formatJSONFiles(memoryDir, maxFileSize, isEligibleFile);
         if (formattedFiles.length > 0) {
           core.info(`Formatted ${formattedFiles.length} repo-memory JSON file(s) before validation: ${formattedFiles.join(", ")}`);
         }
@@ -1866,6 +1977,9 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         if (entry.isDirectory()) {
           scanDir(fullPath, relPath);
         } else if (entry.isFile()) {
+          if (!isEligibleFile(relPath)) {
+            continue;
+          }
           let stats;
           try {
             stats = fs.statSync(fullPath);
@@ -1938,8 +2052,14 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     let patchSizeBytes;
     try {
       ensureSafeDirectoryTrust(memoryDir, server);
-      execGitSync(["add", "--sparse", "."], { cwd: memoryDir, stdio: "pipe" });
-      patchSizeBytes = getStagedPatchDiffSizeBytes({ execGitSyncFn: execGitSync, cwd: memoryDir });
+      const stagedFiles = execGitSync(["diff", "--cached", "--no-renames", "--name-only", "-z"], { cwd: memoryDir, stdio: "pipe" }).split("\0").filter(Boolean).filter(isEligibleFile);
+      const trackedFiles = execGitSync(["ls-files", "-z"], { cwd: memoryDir, stdio: "pipe" }).split("\0").filter(Boolean).filter(isEligibleFile);
+      const filesToStage = [...new Set([...files.map(file => file.relativePath), ...trackedFiles])];
+      if (filesToStage.length > 0) {
+        execGitSync(["add", "--sparse", "--all", "--", ...filesToStage.map(file => `:(literal)${file}`)], { cwd: memoryDir, stdio: "pipe" });
+      }
+      const filesToMeasure = [...new Set([...stagedFiles, ...filesToStage])].map(file => `:(literal)${file}`);
+      patchSizeBytes = getStagedPatchDiffSizeBytes({ execGitSyncFn: execGitSync, cwd: memoryDir, pathspecs: filesToMeasure });
     } catch (/** @type {any} */ error) {
       return {
         content: [
@@ -1980,13 +2100,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     /** @type {ReturnType<typeof runCustomMemoryValidation> | null} */
     let customValidation = null;
     if (validationConfig) {
-      customValidation = runCustomMemoryValidation({
-        script: validationScript,
-        memoryDir,
-        memoryId,
-        kind: "repo",
-        timeoutSeconds: validationTimeoutSeconds,
-      });
+      const validationDir = createEligibleMemoryValidationView(memoryDir, isEligibleFile);
+      try {
+        customValidation = runCustomMemoryValidation({
+          script: validationScript,
+          jsonSchemas,
+          requireJSONSchemas: Boolean(hasJSONSchemas || schemasRequired),
+          memoryDir: validationDir,
+          memoryId,
+          kind: "repo",
+          timeoutSeconds: validationTimeoutSeconds,
+        });
+      } finally {
+        try {
+          fs.rmSync(validationDir, { recursive: true, force: true });
+        } catch (error) {
+          throw new Error(`${ERR_SYSTEM}: Failed to clean up repo-memory validation directory: ${getErrorMessage(error)}`, { cause: error });
+        }
+      }
       if (!customValidation.ok) {
         const reason = customValidation.timedOut ? `timed out after ${validationTimeoutSeconds || 30} second(s)` : `exited with code ${customValidation.exitCode}`;
         return {
@@ -1995,7 +2126,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
               type: "text",
               text: JSON.stringify({
                 result: "error",
-                error: `Custom repo-memory validation failed for '${memoryId}': ${reason}.`,
+                error: `Repo-memory validation failed for '${memoryId}': ${reason}.`,
                 storage_validation: {
                   result: "success",
                   message: `Storage validation passed: ${files.length} file(s), ${totalSizeKb} KB total content, ${patchSizeKb} KB patch diff (${patchSizeBytes} bytes).`,
@@ -2054,7 +2185,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     if (createIssueConfig.require_temporary_id === true && !entry.temporary_id) {
       return buildIntentErrorResponse(buildMissingTemporaryIdError("create_issue", "create-issue"));
     }
-    const intentValidationError = validateCreateIssueIntent(entry);
+    const intentValidationError = validateCreateIssueIntent(entry, createIssueTitlePrefix);
     if (intentValidationError) {
       return buildIntentErrorResponse(intentValidationError);
     }
@@ -2091,7 +2222,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
     if (deduplicateByTitle.enabled) {
       const normalizedTitle = normalizeTitleForDedup(resolvedTitle);
-      const seenTitles = seenIssueTitlesByRepo.get(resolvedRepo) || [];
+      const seenTitles = seenIssueTitlesByRepo.get(scopedKey(resolvedRepo)) || [];
       const duplicate = findDuplicateByTitle(normalizedTitle, seenTitles, deduplicateByTitle.maxDistance);
       if (duplicate) {
         const droppedEntry = {
@@ -2118,7 +2249,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         };
       }
       seenTitles.push({ title: resolvedTitle, normalizedTitle });
-      seenIssueTitlesByRepo.set(resolvedRepo, seenTitles);
+      seenIssueTitlesByRepo.set(scopedKey(resolvedRepo), seenTitles);
     }
 
     const largeContentResponse = maybeHandleLargeContent(entry);
@@ -2264,11 +2395,12 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * Also auto-generates a temporary_id if not provided and returns it to the agent
    */
   const addCommentHandler = args => {
+    const addCommentConfig = getSafeOutputsToolConfig(config, "add_comment");
     // Validate comment constraints before appending to safe outputs
     // This provides early feedback per Requirement MCE1 (Early Validation)
     try {
       const body = (args && args.body) || "";
-      enforceCommentLimits(body);
+      enforceCommentLimits(body, { maxLinks: addCommentConfig.max_links ?? addCommentConfig["max-links"], maxLength: MAX_COMMENT_INPUT_LENGTH });
     } catch (error) {
       // Return validation error with specific constraint violation details
       // Per Requirement MCE3 (Actionable Error Responses)
@@ -2283,7 +2415,6 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // reply_to_id is a discussion-only field; its presence unambiguously means the
     // agent is targeting a GitHub Discussion.  Guard here (MCP phase) so the agent
     // gets immediate, actionable feedback rather than a late failure at execution time.
-    const addCommentConfig = getSafeOutputsToolConfig(config, "add_comment");
     const discussionsEnabled = addCommentConfig.discussions === true;
     const hasReplyToId = args?.reply_to_id != null && String(args.reply_to_id).trim() !== "";
     if (hasReplyToId && !discussionsEnabled) {
@@ -2293,13 +2424,16 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       );
     }
 
-    // Reject target:triggering early when no explicit item number and no issue/PR/discussion context.
+    const entry = { ...(args || {}), type: "add_comment" };
+    const commentIdValidationResult = validateAllowedAddCommentId(entry, addCommentConfig);
+    if (commentIdValidationResult.error) {
+      return commentIdValidationResult.error;
+    }
+
+    // Reject target:triggering early when no issue/PR/discussion target can be resolved.
     // Per Safe Outputs Specification MCE1: provides actionable feedback before writing to NDJSON.
-    // Mirrors update_issue validation; explicit item_number bypasses this check because the
-    // downstream handler resolves explicit numbers before falling back to triggering context.
     const effectiveAddCommentTarget = addCommentConfig.target || "triggering";
-    const hasExplicitItemNumber = args?.item_number != null || args?.issue_number != null || args?.["pr-number"] != null;
-    if (effectiveAddCommentTarget === "triggering" && !hasExplicitItemNumber) {
+    if (effectiveAddCommentTarget === "triggering") {
       /** @type {any} */
       let invocationContext = null;
       try {
@@ -2318,23 +2452,24 @@ function createHandlers(server, appendSafeOutput, config = {}) {
         const isIssueContext = effectiveEventName === "issues" || (effectiveEventName === "issue_comment" && !isIssueCommentOnPR);
         const isPRContext = PR_EVENT_NAMES.has(effectiveEventName) || isIssueCommentOnPR;
         const isDiscussionContext = effectiveEventName === "discussion" || effectiveEventName === "discussion_comment";
-        if (!isIssueContext && !isPRContext && !isDiscussionContext) {
+        const triggeringNumber = isDiscussionContext
+          ? effectivePayload?.discussion?.number
+          : isPRContext
+            ? effectivePayload?.pull_request?.number || (isIssueCommentOnPR ? effectivePayload?.issue?.number : null)
+            : isIssueContext
+              ? effectivePayload?.issue?.number
+              : null;
+        if (!triggeringNumber) {
           return buildIntentErrorResponse(
-            `add_comment requires an issue, pull request, or discussion context but the workflow is running on a "${effectiveEventName}" event. ` +
+            `add_comment cannot resolve an issue, pull request, or discussion target from the "${effectiveEventName}" event payload. ` +
               `The add-comment handler uses target: triggering which only applies when an issue, pull request, or discussion triggered the workflow. ` +
               `To report results from this workflow, use create_discussion or create_issue instead. ` +
-              `If you need to comment on a specific item, provide an explicit item_number.`
+              `If you need to comment on a specific item, configure safe-outputs.add-comment.target to "*" and provide an explicit item_number.`
           );
         }
       }
     }
 
-    // Build the entry with a temporary_id
-    const entry = { ...(args || {}), type: "add_comment" };
-    const commentIdValidationResult = validateAllowedAddCommentId(entry, addCommentConfig);
-    if (commentIdValidationResult.error) {
-      return commentIdValidationResult.error;
-    }
     if (commentIdValidationResult.commentId === undefined) {
       // entry was spread from args, so a blank/whitespace comment_id (rather than an
       // absent one) could still be sitting on entry; strip it so downstream code never
@@ -2386,7 +2521,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * Incremented by createPullRequestReviewCommentHandler, read by submitPullRequestReviewHandler
    * to guard against empty review submissions at the MCP server phase.
    */
-  let inlineReviewCommentCount = 0;
+  const inlineReviewCommentCounts = new Map();
 
   /**
    * Handler for create_pull_request_review_comment tool (MCP server phase).
@@ -2401,7 +2536,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     // (e.g. due to large-content rejection or an append write error) the counter
     // must not advance so the empty-review guard remains accurate.
     if (!result?.isError) {
-      inlineReviewCommentCount++;
+      const key = scopedKey("review");
+      inlineReviewCommentCounts.set(key, (inlineReviewCommentCounts.get(key) || 0) + 1);
     }
     return result;
   };
@@ -2439,7 +2575,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       };
     }
 
-    if (!body && inlineReviewCommentCount === 0) {
+    if (!body && !inlineReviewCommentCounts.get(scopedKey("review"))) {
       throw {
         code: -32602,
         message:
@@ -2451,7 +2587,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
 
     // Reset the counter after a successful review submission so that subsequent
     // reviews in the same MCP session start with a clean slate.
-    inlineReviewCommentCount = 0;
+    inlineReviewCommentCounts.delete(scopedKey("review"));
 
     return defaultHandler("submit_pull_request_review")(args);
   };
@@ -2637,7 +2773,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     if (typeof entry.path === "string") {
       // Enforce allowed canonical source roots: staging dir and GITHUB_WORKSPACE.
       // RUNNER_TEMP is intentionally excluded — only the specific staging subdirectory is allowed.
-      const stagingDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-artifacts");
+      const stagingRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-artifacts");
+      const stagingDir = currentClaimHandle() ? claimArtifactPath(stagingRoot, currentClaimHandle()) : stagingRoot;
 
       let filePath = entry.path;
       if (!path.isAbsolute(filePath)) {
@@ -2776,7 +2913,8 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    */
   const uploadCodeCoverageHandler = args => {
     const entry = { ...(args || {}), type: "upload_code_coverage" };
-    const stagingDir = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-code-coverage");
+    const stagingRoot = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw", "safeoutputs", "upload-code-coverage");
+    const stagingDir = currentClaimHandle() ? claimArtifactPath(stagingRoot, currentClaimHandle()) : stagingRoot;
     const coverageRoot = process.env.GITHUB_WORKSPACE ? path.join(process.env.GITHUB_WORKSPACE, "coverage") : "";
 
     if (typeof entry.file === "string") {
@@ -2906,6 +3044,15 @@ function createHandlers(server, appendSafeOutput, config = {}) {
    * instead of a downstream Process Safe Outputs failure.
    */
   const updateIssueHandler = args => {
+    const normalizedArgs = normalizeBlankOptionalFields(args, safeOutputsToolMap.get("update_issue").inputSchema.properties);
+    const updateFields = ["status", "title", "body", "labels", "assignees", "milestone"];
+    if (!updateFields.some(field => normalizedArgs[field] !== undefined && normalizedArgs[field] !== false && (normalizedArgs[field] !== null || field === "milestone"))) {
+      throw {
+        code: -32602,
+        message: `${ERR_VALIDATION}: update_issue requires at least one of: ${updateFields.join(", ")} fields`,
+      };
+    }
+
     const updateIssueConfig = getSafeOutputsToolConfig(config, "update_issue");
     const effectiveTarget = updateIssueConfig.target || "triggering";
 
@@ -2938,7 +3085,7 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       }
     }
 
-    return defaultHandler("update_issue")(args || {});
+    return defaultHandler("update_issue")(normalizedArgs);
   };
 
   const jiraCreateIssueHandler = args => {
@@ -3257,8 +3404,10 @@ function createHandlers(server, appendSafeOutput, config = {}) {
       `To close a specific discussion, supply discussion_number explicitly.`,
   });
 
-  return {
+  const handlers = {
     defaultHandler,
+    ledgerBuiltinHandler,
+    ledgerAgentAppendHandler,
     uploadAssetHandler,
     uploadArtifactHandler,
     uploadCodeCoverageHandler,
@@ -3294,6 +3443,25 @@ function createHandlers(server, appendSafeOutput, config = {}) {
     updateDiscussionHandler,
     closeDiscussionHandler,
   };
+  const scopedHandler =
+    (handler, type) =>
+    (...args) => {
+      const executionHandle = currentClaimHandle();
+      const scope = executionHandle ? null : readClaimScopeContext();
+      if (!scope && !executionHandle) return handler(...args);
+      const message = normalizeRuntimeMessage(type ? { ...(args[0] || {}), type } : args[0] || {});
+      if (type && !Object.hasOwn(args[0] || {}, "type")) delete message.type;
+      if (executionHandle) return handler(message, ...args.slice(1));
+      return withClaimExecution({ ...scope, claim_handle: message.claim_handle }, () => handler(message, ...args.slice(1)));
+    };
+  return Object.fromEntries(
+    Object.entries(handlers).map(([name, handler]) => [
+      name,
+      ["defaultHandler", "ledgerBuiltinHandler"].includes(name)
+        ? (...args) => scopedHandler(Reflect.apply(handler, undefined, args), name === "defaultHandler" ? args[0] : "ledger_append")
+        : scopedHandler(handler, name === "ledgerAgentAppendHandler" ? "ledger_append" : undefined),
+    ])
+  );
 }
 
 module.exports = {

@@ -16,6 +16,7 @@ const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { enforceCommentLimits } = require("./comment_limit_helpers.cjs");
 const { COMMENT_MEMORY_TAG, COMMENT_MEMORY_MAX_SCAN_PAGES, COMMENT_MEMORY_CODE_FENCE, buildCodeFenceOpener } = require("./comment_memory_helpers.cjs");
 const { getBodyFooterMessage } = require("./messages_footer.cjs");
+const { appendExecutionProvenance } = require("./execution_provenance.cjs");
 // Require provenance marker to avoid accidentally updating user-authored comments
 // that happen to contain a matching comment-memory tag.
 const MANAGED_COMMENT_PROVENANCE_MARKER = "<!-- gh-aw-agentic-workflow:";
@@ -36,15 +37,23 @@ function sanitizeMemoryID(memoryID) {
   return normalized;
 }
 
+function buildCollapsedMemorySection(rawBody, memoryID) {
+  return `<details>
+<summary>Peek at saved memory (${memoryID})</summary>
+
+${buildCodeFenceOpener(memoryID)}
+${sanitizeContent(rawBody)}
+${COMMENT_MEMORY_CODE_FENCE}
+
+</details>`;
+}
+
 function buildManagedMemoryBody(rawBody, memoryID, options) {
   const { includeFooter, bodyFooter, runUrl, workflowName, workflowSource, workflowSourceURL, historyUrl, triggeringIssueNumber, triggeringPRNumber } = options;
   if (!/^[a-zA-Z0-9_-]+$/.test(memoryID)) {
     throw new Error(`${SAFE_OUTPUT_E001}: memory_id must contain only alphanumeric characters, hyphens, and underscores`);
   }
   core.info(`comment_memory: building managed body for memory_id='${memoryID}'`);
-  // Use code-fence-as-container so the memory content is visible in GitHub's rendered Markdown.
-  // The language specifier encodes the memory ID: ``````gh-aw-comment-memory:<id>
-  const codeFenceOpener = buildCodeFenceOpener(memoryID);
 
   const markdownParts = assembleMarkdownBodyParts({
     includeFooter,
@@ -62,7 +71,8 @@ function buildManagedMemoryBody(rawBody, memoryID, options) {
   const detectionCaution = markdownParts.detectionCaution;
   const cautionPrefix = detectionCaution ? detectionCaution + "\n\n" : "";
 
-  let body = `${cautionPrefix}${MANAGED_COMMENT_HEADER}\n\n${codeFenceOpener}\n${sanitizeContent(rawBody)}\n${COMMENT_MEMORY_CODE_FENCE}`;
+  // Keep the tagged code fence intact for memory extraction inside the collapsed section.
+  let body = `${cautionPrefix}${MANAGED_COMMENT_HEADER}\n\n${buildCollapsedMemorySection(rawBody, memoryID)}`;
 
   const tracker = getTrackerID("markdown");
   if (tracker) {
@@ -202,17 +212,21 @@ async function main(config = {}) {
         serverUrl: context.serverUrl,
       }) || undefined;
 
-    const managedBody = buildManagedMemoryBody(message.body || "", memoryID, {
-      includeFooter,
-      runUrl,
+    const managedBody = appendExecutionProvenance(
+      buildManagedMemoryBody(message.body || "", memoryID, {
+        includeFooter,
+        runUrl,
+        workflowName,
+        workflowSource,
+        workflowSourceURL,
+        historyUrl,
+        triggeringIssueNumber,
+        triggeringPRNumber,
+        bodyFooter: config.body_footer,
+      }),
       workflowName,
-      workflowSource,
-      workflowSourceURL,
-      historyUrl,
-      triggeringIssueNumber,
-      triggeringPRNumber,
-      bodyFooter: config.body_footer,
-    });
+      runUrl
+    );
     try {
       enforceCommentLimits(managedBody);
     } catch (error) {

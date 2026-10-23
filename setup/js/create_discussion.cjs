@@ -18,6 +18,7 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { createExpirationLine, generateFooterWithExpiration, addExpirationToFooter } = require("./ephemerals.cjs");
 const { assembleMarkdownBodyParts } = require("./markdown_body_helpers.cjs");
+const { appendExecutionProvenance } = require("./execution_provenance.cjs");
 const { getBodyFooterMessage } = require("./messages_footer.cjs");
 const { getBodyHeader, getDisclosureHeader } = require("./messages_header.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
@@ -32,7 +33,10 @@ const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { generateHistoryLink, generateHistoryUrl } = require("./generate_history_link.cjs");
 const { MAX_LABELS } = require("./constants.cjs");
 const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
+const { captureDiscussionDelivery } = require("./work_queue_native_creation_delivery.cjs");
+const { graphEffectIdentity } = require("./work_queue_effect_client.cjs");
+const { currentClaimHandle } = require("./work_queue_claim_scope.cjs");
 
 /**
  * Fetch repository ID and discussion categories for a repository
@@ -179,7 +183,7 @@ async function fetchLabelIds(githubClient, owner, repo, labelNames) {
  * @param {string[]} labelIds - Array of label node IDs to add
  * @returns {Promise<boolean>} True if labels were applied successfully
  */
-async function applyLabelsToDiscussion(githubClient, discussionId, labelIds) {
+async function applyLabelsToDiscussion(githubClient, discussionId, labelIds, effectIds = []) {
   if (!labelIds || labelIds.length === 0) {
     return true; // Nothing to do
   }
@@ -192,12 +196,10 @@ async function applyLabelsToDiscussion(githubClient, discussionId, labelIds) {
           labelIds: $labelIds
         }) {
           labelable {
-            ... on Discussion {
-              id
-              labels(first: 10) {
-                nodes {
-                  name
-                }
+            id
+            labels(first: 10) {
+              nodes {
+                name
               }
             }
           }
@@ -209,6 +211,7 @@ async function applyLabelsToDiscussion(githubClient, discussionId, labelIds) {
       labelableId: discussionId,
       labelIds: labelIds,
     });
+    if (currentClaimHandle()) effectIds.push(graphEffectIdentity(addLabelsMutation, { labelableId: discussionId, labelIds }, mutationResult));
 
     const appliedLabels = mutationResult?.addLabelsToLabelable?.labelable?.labels?.nodes || [];
     core.info(`Successfully applied ${appliedLabels.length} labels to discussion`);
@@ -266,6 +269,8 @@ async function handleFallbackToIssue(createIssueHandler, item, qualifiedItemRepo
         repo: issueResult.repo,
         number: issueResult.number,
         url: issueResult.url,
+        temporaryId: issueResult.temporaryId,
+        body: issueResult.body,
         fallback: "issue", // Indicate this was a fallback
       };
     } else {
@@ -314,11 +319,11 @@ async function main(config = {}) {
   // (for cross-repository operations), otherwise falls back to the step-level github.
   const githubClient = await createAuthenticatedGitHubClient(config);
   const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
-  let allowedMentionAliases = [];
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   // Check if we're in staged mode
@@ -411,6 +416,7 @@ async function main(config = {}) {
       };
     }
     const { repo: qualifiedItemRepo, repoParts } = repoResult;
+    const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
 
     // Get repository info (cached)
     let repoInfo = repoInfoCache.get(qualifiedItemRepo);
@@ -612,7 +618,7 @@ async function main(config = {}) {
     }
 
     bodyLines.push("");
-    const body = bodyLines.join("\n").trim();
+    const body = appendExecutionProvenance(bodyLines.join("\n").trim(), workflowName, runUrl);
 
     core.info(`Creating discussion in ${qualifiedItemRepo} with title: ${title}`);
 
@@ -638,6 +644,7 @@ async function main(config = {}) {
     // an issue — the discussion already exists.
     /** @type {any} */
     let createdDiscussion = null;
+    const effectIds = [];
 
     try {
       const createDiscussionMutation = `
@@ -664,6 +671,7 @@ async function main(config = {}) {
         title: title,
         body: body,
       });
+      if (currentClaimHandle()) effectIds.push(graphEffectIdentity(createDiscussionMutation, { repositoryId: repoInfo.repositoryId, categoryId, title, body }, mutationResult));
 
       const discussion = mutationResult.createDiscussion.discussion;
       if (!discussion) {
@@ -716,7 +724,7 @@ async function main(config = {}) {
         const labelIdsData = await fetchLabelIds(githubClient, repoParts.owner, repoParts.repo, discussionLabels);
         if (labelIdsData.length > 0) {
           const labelIds = labelIdsData.map(l => l.id);
-          const labelsApplied = await applyLabelsToDiscussion(githubClient, discussion.id, labelIds);
+          const labelsApplied = await applyLabelsToDiscussion(githubClient, discussion.id, labelIds, effectIds);
           if (labelsApplied) {
             core.info(`✓ Applied labels: ${labelIdsData.map(l => l.name).join(", ")}`);
           }
@@ -725,12 +733,18 @@ async function main(config = {}) {
         }
       }
 
-      return {
-        success: true,
-        repo: qualifiedItemRepo,
-        number: discussion.number,
-        url: discussion.url,
-      };
+      return captureDiscussionDelivery(
+        {
+          success: true,
+          repo: qualifiedItemRepo,
+          number: discussion.number,
+          url: discussion.url,
+          temporaryId,
+          body,
+        },
+        message,
+        { id: discussion.id, number: discussion.number, url: discussion.url, repository: qualifiedItemRepo, repositoryNodeId: repoInfo.repositoryId, category: categoryId, title, body, labels: discussionLabels, effectIds }
+      );
     } catch (error) {
       const errorMessage = getErrorMessage(error);
 
@@ -758,12 +772,29 @@ async function main(config = {}) {
       const resolvedDiscussion = createdDiscussion || partialDiscussion;
       if (resolvedDiscussion) {
         core.warning(`Discussion ${qualifiedItemRepo}#${resolvedDiscussion.number} was created but a post-creation operation failed: ${errorMessage}`);
-        return {
-          success: true,
-          repo: qualifiedItemRepo,
-          number: resolvedDiscussion.number,
-          url: resolvedDiscussion.url,
-        };
+        return captureDiscussionDelivery(
+          {
+            success: true,
+            repo: qualifiedItemRepo,
+            number: resolvedDiscussion.number,
+            url: resolvedDiscussion.url,
+            temporaryId,
+            body,
+          },
+          message,
+          {
+            id: resolvedDiscussion.id,
+            number: resolvedDiscussion.number,
+            url: resolvedDiscussion.url,
+            repository: qualifiedItemRepo,
+            repositoryNodeId: repoInfo.repositoryId,
+            category: categoryId,
+            title,
+            body,
+            labels: discussionLabels,
+            effectIds,
+          }
+        );
       }
 
       // Check if this is a permissions error and fallback is enabled

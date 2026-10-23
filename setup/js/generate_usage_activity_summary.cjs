@@ -9,16 +9,23 @@
 //   integrity: aggregate DIFC filtering counts from gateway/RPC logs
 //   steering: aggregate AWF steering-event counts by event type
 //   safe_outputs: total item count and per-type breakdown from safe-output-items manifest
+//   ledger: number of recorded ledger append transactions
 //   experiments: A/B experiment variant assignments for the current run
 //   working_set: cumulative input-token traffic relative to peak invocation input
 //   friction: precomputed cost of wasted work (AIC canonical) with attribution states
 
+const { iterateJsonl, iterateLines } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const { readExperimentAssignments } = require("./experiment_helpers.cjs");
 const { countSteeringEventsByTypeInApiProxyJsonl } = require("./steering_helpers.cjs");
 const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
 const { computeFrictionCost } = require("./friction_cost_metrics.cjs");
+const { formatAIC } = require("./model_costs.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { parseDetectionLog, parseStructuredResultFile } = require("./parse_threat_detection_results.cjs");
+const { normalizeCopilotSession, copilotSessionContext } = require("./copilot_session.cjs");
+const { sessionToolSuccess } = require("./agent_session.cjs");
 
 require("./shim.cjs");
 
@@ -32,6 +39,8 @@ const PLACEHOLDER_DOMAIN_KEY = "-";
 const PLACEHOLDER_DEST_KEY = "-:-";
 const ERROR_DOMAIN_PREFIX = "error:";
 const AGENT_TOKEN_USAGE_PATH = "/tmp/gh-aw/usage/agent/token_usage.jsonl";
+const DETECTION_DIR = "/tmp/gh-aw/threat-detection";
+const DETECTION_USAGE_RESULT_PATH = "/tmp/gh-aw/usage/detection/detection_result.json";
 const RPC_EVENT_TO_TYPE = { rpc_request: "REQUEST", rpc_response: "RESPONSE", difc_filtered: "DIFC_FILTERED" };
 const API_PROXY_EVENT_LOG_PATHS = [
   "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/event-logs.jsonl",
@@ -96,7 +105,7 @@ function parseWorkingSetMetrics(tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
   try {
     return calculateWorkingSetFromJSONL(fs.readFileSync(tokenUsagePath, "utf-8"));
   } catch (err) {
-    throw new Error(`Failed to read working-set token usage from ${tokenUsagePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read working-set token usage from ${tokenUsagePath}: ${getErrorMessage(err)}`, { cause: err });
   }
 }
 
@@ -139,6 +148,105 @@ function buildFrictionSummary(activity, tokenUsagePath = AGENT_TOKEN_USAGE_PATH)
     core.warning(warning);
   }
   return friction;
+}
+
+/**
+ * Render friction-cost data as a collapsed GitHub step summary section.
+ *
+ * @param {Record<string, any>} friction
+ * @returns {string}
+ */
+function buildFrictionStepSummary(friction) {
+  if (!friction || typeof friction !== "object") return "";
+
+  const state = typeof friction.measurement_state === "string" ? friction.measurement_state : "unavailable";
+  const cost = friction.cost && typeof friction.cost === "object" ? friction.cost : {};
+  const aic = Number.isFinite(cost.aic) ? formatAIC(cost.aic) || "0" : "unavailable";
+  const occurrences = Number.isFinite(friction.counted_occurrences) ? friction.counted_occurrences.toLocaleString() : "0";
+  const tokens = Number.isFinite(cost.tokens?.total) ? cost.tokens.total.toLocaleString() : "0";
+  const turns = Number.isFinite(cost.turns) ? cost.turns.toLocaleString() : "0";
+  const toolCalls = Number.isFinite(cost.tool_calls) ? cost.tool_calls.toLocaleString() : "0";
+  const latency = Number.isFinite(cost.latency_ms) ? `${cost.latency_ms.toLocaleString()} ms` : "0 ms";
+  const ratio = state !== "unavailable" && Number.isFinite(friction.friction_ratio) ? `${(friction.friction_ratio * 100).toFixed(1)}%` : "unavailable";
+  const lines = [
+    "<details>",
+    `<summary>Friction Cost: ${aic} AIC (${state})</summary>`,
+    "",
+    "### Friction Cost",
+    "",
+    "| AI credits | Run cost ratio | Counted occurrences | Tokens | Turns | Tool calls | Latency |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| ${aic} | ${ratio} | ${occurrences} | ${tokens} | ${turns} | ${toolCalls} | ${latency} |`,
+  ];
+
+  if (Array.isArray(friction.drivers) && friction.drivers.length > 0) {
+    lines.push("", "#### Drivers", "", "| Driver | Source | State | Occurrences | AI credits |", "| --- | --- | --- | ---: | ---: |");
+    for (const driver of friction.drivers) {
+      const driverAIC = Number.isFinite(driver.cost?.aic) ? formatAIC(driver.cost.aic) || "0" : "unavailable";
+      const driverOccurrences = Number.isFinite(driver.counted_occurrences) ? driver.counted_occurrences.toLocaleString() : "0";
+      lines.push(`| \`${driver.driver || "unknown"}\` | \`${driver.source || "unknown"}\` | \`${driver.state || "unavailable"}\` | ${driverOccurrences} | ${driverAIC} |`);
+    }
+  }
+
+  lines.push("", "</details>", "");
+  return lines.join("\n");
+}
+
+/**
+ * Determine whether a trailing-newline separator is needed before appending to an
+ * existing file, without reading the whole file into memory (step summary files can
+ * grow large over a run).
+ *
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function needsLeadingNewlineSeparator(filePath) {
+  let fd;
+  try {
+    const { size } = fs.statSync(filePath);
+    if (size === 0) return false;
+    fd = fs.openSync(filePath, "r");
+    const buffer = Buffer.alloc(1);
+    fs.readSync(fd, buffer, 0, 1, size - 1);
+    return buffer.toString("utf8") !== "\n";
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
+ * Append the rendered friction-cost section to $GITHUB_STEP_SUMMARY when the
+ * GITHUB_STEP_SUMMARY env var is set (the normal Actions runner case, including under
+ * `github-script`). Otherwise falls back to `core.summary.addRaw`/`write` when that API is
+ * available, and is a no-op when neither is usable — this script normally runs as a plain
+ * `node` process where `core.summary` is not provided by the shim.
+ *
+ * @param {string} section
+ * @returns {Promise<void>}
+ */
+async function writeFrictionStepSummary(section) {
+  if (!section) return;
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (summaryPath) {
+    try {
+      const separator = needsLeadingNewlineSeparator(summaryPath) ? "\n" : "";
+      fs.appendFileSync(summaryPath, `${separator}${section}`, "utf8");
+    } catch (err) {
+      core.warning(`Failed to append friction-cost step summary: ${getErrorMessage(err)}`);
+    }
+    return;
+  }
+  if (core.summary && typeof core.summary.addRaw === "function") {
+    await core.summary.addRaw(section).write();
+  }
 }
 
 /**
@@ -220,7 +328,7 @@ function parseFirewallLogs() {
     for (const logPath of findFiles(logDir, entry => entry.name.endsWith(".log"))) {
       try {
         const content = fs.readFileSync(logPath, "utf-8");
-        const lines = content.split("\n");
+        const lines = iterateLines(content);
 
         for (const raw of lines) {
           const line = raw.trim();
@@ -334,31 +442,23 @@ function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copil
     failed_tool_executions: 0,
   };
   const skills = new Map();
-  const pendingSkills = new Map();
 
   for (const logDir of sessionLogDirs) {
     for (const eventsPath of findFiles(logDir, entry => entry.name === "events.jsonl", 1)) {
       try {
-        const pendingSkillsWithoutIDs = [];
+        const pendingTools = new Map();
+        const sourceSessions = new Map();
+        const childSessions = new Map();
+        const entries = [];
         const content = fs.readFileSync(eventsPath, "utf-8");
-        const lines = content.split("\n");
-
-        for (const raw of lines) {
-          const line = raw.trim();
-          if (!line || !line.startsWith("{")) {
-            continue;
-          }
-
-          let entry;
-          try {
-            entry = JSON.parse(line);
-          } catch {
-            continue;
-          }
+        for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
 
           const eventType = String(entry.type || "")
             .trim()
             .toLowerCase();
+          entries.push({ ...entry, type: eventType });
+          if (entry.copilotProjection) continue;
           session.total_events += 1;
 
           if (eventType === "session.start") {
@@ -376,14 +476,32 @@ function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copil
             session.reasoning_events += 1;
           } else if (eventType === "tool.execution_start") {
             session.tool_execution_starts += 1;
-            const data = entry.data && typeof entry.data === "object" ? entry.data : {};
-            if (
-              String(data.toolName || "")
-                .trim()
-                .toLowerCase() === "skill"
-            ) {
-              const input = data.input && typeof data.input === "object" ? data.input : data.arguments && typeof data.arguments === "object" ? data.arguments : {};
-              const skillName = String(input.skill || "").trim();
+          } else if (eventType === "tool.execution_complete") {
+            session.tool_execution_completes += 1;
+          }
+        }
+
+        for (const entry of normalizeCopilotSession(entries)) {
+          if (entry.copilotProjection) continue;
+          /** @type {Record<string, any>} */
+          const data = entry.data;
+          const context = copilotSessionContext(entry);
+          const provenance = entry.provenance && typeof entry.provenance === "object" ? entry.provenance : {};
+          const sourceKey = JSON.stringify(["component" in provenance ? provenance.component : undefined, "phase" in provenance ? provenance.phase : undefined, "path" in provenance ? provenance.path : undefined]);
+          const childKey = JSON.stringify([sourceKey, context.agentId, context.parentToolUseId]);
+          if (["session.start", "session.init"].includes(entry.type) && context.sessionId !== undefined) {
+            if (context.agentId !== undefined || context.parentToolUseId) childSessions.set(childKey, context.sessionId);
+            else sourceSessions.set(sourceKey, context.sessionId);
+          }
+          const sessionId = context.sessionId !== undefined ? context.sessionId : childSessions.has(childKey) ? childSessions.get(childKey) : sourceSessions.get(sourceKey);
+          const scope = JSON.stringify([sourceKey, sessionId, context.agentId, context.parentToolUseId]);
+          const pending = pendingTools.get(scope) || [];
+          const toolName = typeof data.toolName === "string" ? data.toolName.trim().toLowerCase() : undefined;
+          if (entry.type === "tool.execution_start") {
+            let skillName;
+            if (toolName === "skill") {
+              const input = data.input && typeof data.input === "object" ? data.input : {};
+              skillName = String(input.skill || "").trim();
               if (skillName) {
                 const aggregate = skills.get(skillName) || {
                   name: skillName,
@@ -401,35 +519,20 @@ function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copil
                   aggregate.last_timestamp = timestamp;
                 }
                 skills.set(skillName, aggregate);
-                if (data.toolCallId) {
-                  pendingSkills.set(String(data.toolCallId), skillName);
-                } else {
-                  pendingSkillsWithoutIDs.push(skillName);
-                }
               }
             }
-          } else if (eventType === "tool.execution_complete") {
-            session.tool_execution_completes += 1;
-            const data = entry.data || {};
-            const success = typeof data === "object" ? data.success !== false : true;
-            let skillName = pendingSkills.get(String(data.toolCallId || ""));
-            if (
-              !skillName &&
-              String(data.toolName || "")
-                .trim()
-                .toLowerCase() === "skill"
-            ) {
-              // SDK events without IDs are paired in start order within this session file.
-              skillName = pendingSkillsWithoutIDs.shift();
-            }
-            if (!success) {
+            pending.push({ id: data.toolCallId, toolName, skillName });
+            pendingTools.set(scope, pending);
+          } else if (entry.type === "tool.execution_complete") {
+            const candidates = pending.filter(tool => (data.toolCallId !== undefined ? tool.id === data.toolCallId : tool.id === undefined && (toolName === undefined || tool.toolName === toolName)));
+            // A nameless, ID-less completion is attributable only when unambiguous.
+            const start = data.toolCallId !== undefined || toolName !== undefined || candidates.length === 1 ? candidates[0] : undefined;
+            if (start) pending.splice(pending.indexOf(start), 1);
+            if (sessionToolSuccess(data) === false) {
               session.failed_tool_executions += 1;
-              if (skillName && skills.has(skillName)) {
-                skills.get(skillName).failed_count += 1;
+              if (start?.skillName && skills.has(start.skillName)) {
+                skills.get(start.skillName).failed_count += 1;
               }
-            }
-            if (typeof data === "object" && data.toolCallId) {
-              pendingSkills.delete(String(data.toolCallId));
             }
           }
         }
@@ -649,13 +752,8 @@ function getRpcMessageType(entry) {
  * @param {string} content
  */
 function parseGatewayJSONL(activity, content) {
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
-    if (!line || !line.startsWith("{")) {
-      continue;
-    }
+  for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
     try {
-      const entry = JSON.parse(line);
       if (!entry || typeof entry !== "object") {
         continue;
       }
@@ -701,13 +799,8 @@ function parseGatewayJSONL(activity, content) {
  */
 function parseRPCMessagesJSONL(activity, content) {
   const pending = new Map();
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
-    if (!line || !line.startsWith("{")) {
-      continue;
-    }
+  for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
     try {
-      const entry = JSON.parse(line);
       if (!entry || typeof entry !== "object") {
         continue;
       }
@@ -853,6 +946,8 @@ function parseGatewayLogs() {
   return parseGatewayActivity().gateway;
 }
 
+const MANIFEST_FILE_PATH = "/tmp/gh-aw/safe-output-items.jsonl";
+
 /**
  * Parse the safe-output-items manifest and aggregate item counts by type.
  * Reads the JSONL file written by the safe_outputs job and downloaded into
@@ -867,8 +962,6 @@ function parseGatewayLogs() {
  * @param {string} [manifestPath] - Path to the manifest file (defaults to MANIFEST_FILE_PATH)
  * @returns {{ total_items: number, items_by_type: Record<string, number>, items: Array<Record<string, any>> } | null}
  */
-const MANIFEST_FILE_PATH = "/tmp/gh-aw/safe-output-items.jsonl";
-
 function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
   if (!fs.existsSync(manifestPath)) {
     return null;
@@ -887,19 +980,8 @@ function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
   const items = [];
   let totalItems = 0;
 
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
-    if (!line || !line.startsWith("{")) {
-      continue;
-    }
-
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
+  for (const entry of iterateJsonl(content)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const itemType = String(entry.type || "").trim();
     if (!itemType) {
       continue;
@@ -915,6 +997,45 @@ function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
     items_by_type: itemsByType,
     items,
   };
+}
+
+function parseLedgerCompaction(value = process.env.GH_AW_LEDGER_COMPACTION) {
+  if (!value) return null;
+  try {
+    const compaction = JSON.parse(value);
+    if (
+      !compaction ||
+      typeof compaction !== "object" ||
+      !["before", "after", "selected", "records", "retired"].every(key => Number.isSafeInteger(compaction[key]) && compaction[key] >= 0) ||
+      !(compaction.replacement === null || typeof compaction.replacement === "string") ||
+      typeof compaction.changed !== "boolean"
+    ) {
+      return null;
+    }
+    return {
+      before: compaction.before,
+      after: compaction.after,
+      selected: compaction.selected,
+      records: compaction.records,
+      replacement: compaction.replacement,
+      retired: compaction.retired,
+      changed: compaction.changed,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function ledgerActivityFromSafeOutputs(safeOutputs, compaction = parseLedgerCompaction()) {
+  if (safeOutputs === null && compaction === null) return null;
+  const activity = {};
+  if (safeOutputs !== null) {
+    activity.transactions_added = safeOutputs.items_by_type.ledger_mutation || 0;
+  }
+  if (compaction !== null) {
+    activity.compaction = compaction;
+  }
+  return activity;
 }
 
 /**
@@ -935,7 +1056,47 @@ function parseExperimentsData() {
 /**
  * Main function to generate usage activity summary
  */
-function main() {
+function writeDetectionUsageResult(detectionDir = DETECTION_DIR, outputPath = DETECTION_USAGE_RESULT_PATH) {
+  const jobResult = process.env.GH_AW_DETECTION_JOB_RESULT || "";
+  if (!["success", "failure", "cancelled", "skipped"].includes(jobResult)) {
+    return;
+  }
+
+  const result = {
+    job_result: jobResult,
+    conclusion: ["success", "failure", "warning", "skipped"].includes(process.env.GH_AW_DETECTION_CONCLUSION || "") ? process.env.GH_AW_DETECTION_CONCLUSION : "",
+    reason: ["threat_detected", "agent_failure", "parse_error", "detection_skipped"].includes(process.env.GH_AW_DETECTION_REASON || "") ? process.env.GH_AW_DETECTION_REASON : "",
+  };
+  if (jobResult !== "skipped") {
+    const structured = parseStructuredResultFile(path.join(detectionDir, "detection_result.json"));
+    let parsed = structured;
+    if (!parsed?.verdict) {
+      const logPath = path.join(detectionDir, "detection.log");
+      if (fs.existsSync(logPath)) {
+        try {
+          parsed = parseDetectionLog(fs.readFileSync(logPath, "utf8"));
+        } catch {
+          parsed = null;
+        }
+      }
+    }
+    if (parsed?.verdict) {
+      const { prompt_injection, secret_leak, malicious_patch } = parsed.verdict;
+      result.prompt_injection = prompt_injection;
+      result.secret_leak = secret_leak;
+      result.malicious_patch = malicious_patch;
+    }
+  }
+  try {
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, JSON.stringify(result), "utf8");
+  } catch (err) {
+    throw new Error(`Failed to write detection usage result at ${outputPath}: ${getErrorMessage(err)}`, { cause: err });
+  }
+}
+
+async function main() {
+  writeDetectionUsageResult();
   const summary = { schema: "usage-activity-summary/v1" };
 
   // Parse firewall logs
@@ -976,8 +1137,10 @@ function main() {
   //   • safe_outputs.total_items > 0  → manifest present with N items
   // A read error is kept separate: it logs a warning but omits safe_outputs so
   // the consumer cannot mistake a broken artifact for a legitimately empty one.
+  /** @type {ReturnType<typeof parseSafeOutputsManifest>} */
+  let safeOutputs = null;
   try {
-    const safeOutputs = parseSafeOutputsManifest();
+    safeOutputs = parseSafeOutputsManifest();
     if (safeOutputs === null) {
       core.info(`safe-output-items manifest not found at ${MANIFEST_FILE_PATH} — safe-outputs-items artifact may not have been downloaded`);
     } else {
@@ -989,7 +1152,11 @@ function main() {
       }
     }
   } catch (err) {
-    core.warning(`safe-output-items manifest could not be read from ${MANIFEST_FILE_PATH}: ${String(err)} — safe_outputs omitted from summary`);
+    core.warning(`safe-output-items manifest could not be read from ${MANIFEST_FILE_PATH}: ${getErrorMessage(err)} — safe_outputs omitted from summary`);
+  }
+  const ledger = ledgerActivityFromSafeOutputs(safeOutputs);
+  if (ledger) {
+    summary.ledger = ledger;
   }
 
   // Include A/B experiment assignments so the CLI can read them from the usage artifact.
@@ -1008,7 +1175,7 @@ function main() {
     }
   } catch (err) {
     summary.working_set = calculateWorkingSetFromJSONL("").workingSet;
-    core.warning(`Working-set rebuild measurement unavailable: ${String(err)}`);
+    core.warning(`Working-set rebuild measurement unavailable: ${getErrorMessage(err)}`);
   }
 
   // Compute precomputed friction cost from every activity section already parsed.
@@ -1022,7 +1189,7 @@ function main() {
       firewall: summary.firewall || null,
     });
   } catch (err) {
-    core.warning(`Friction-cost measurement unavailable: ${String(err)}`);
+    core.warning(`Friction-cost measurement unavailable: ${getErrorMessage(err)}`);
   }
 
   // Write summary to file
@@ -1030,27 +1197,40 @@ function main() {
   try {
     fs.writeFileSync(outputPath, JSON.stringify(summary, null, 2), "utf-8");
   } catch (err) {
-    throw new Error(`Failed to write file ${outputPath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to write file ${outputPath}: ${getErrorMessage(err)}`, { cause: err });
   }
   core.info(outputPath);
+
+  if (summary.friction) {
+    await writeFrictionStepSummary(buildFrictionStepSummary(summary.friction));
+  }
 }
 
 // Run main function
 if (require.main === module) {
-  main();
+  main().catch(err => {
+    console.error(err instanceof Error && err.stack ? err.stack : getErrorMessage(err));
+    process.exitCode = 1;
+  });
 }
 
 module.exports = {
+  main,
+  writeDetectionUsageResult,
   parseFirewallLogs,
   parseSessionLogs,
   parseSteeringEvents,
   parseGatewayLogs,
   parseGatewayActivity,
   parseSafeOutputsManifest,
+  parseLedgerCompaction,
+  ledgerActivityFromSafeOutputs,
   parseExperimentsData,
   calculateWorkingSetFromJSONL,
   parseWorkingSetMetrics,
   buildFrictionSummary,
+  buildFrictionStepSummary,
+  writeFrictionStepSummary,
   readTokenUsageContent,
   AGENT_TOKEN_USAGE_PATH,
   MANIFEST_FILE_PATH,

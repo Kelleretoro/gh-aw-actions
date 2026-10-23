@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonl, iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 /**
  * push_experiment_state
  *
@@ -143,20 +144,7 @@ function mergeExperimentStateJSONL(remoteContent, localContent) {
   const merged = [];
   const seen = new Set();
   for (const content of [remoteContent, localContent]) {
-    for (const line of content.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
-      let entry;
-      try {
-        entry = JSON.parse(trimmed);
-      } catch {
-        // Skip lines that cannot be parsed as JSON. This makes the merge resilient
-        // to partial writes or corruption in either side of the conflict.
-        core.warning(`mergeExperimentStateJSONL: skipping unparseable line during conflict merge`);
-        continue;
-      }
+    for (const entry of iterateJsonl(content, { onError: () => core.warning("mergeExperimentStateJSONL: skipping unparseable line during conflict merge") })) {
       const key = stableJSONStringify(entry);
       if (!seen.has(key)) {
         seen.add(key);
@@ -225,21 +213,17 @@ function mergeAppendOnlyJSONL(remoteContent, localContent) {
   const merged = [];
   const seen = new Set();
   for (const content of [remoteContent, localContent]) {
-    for (const line of content.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
+    for (const event of iterateJsonlEvents(content)) {
+      if (event.type === "invalid" && event.reason === "blank") continue;
       let outputLine;
       let key;
-      try {
-        const entry = JSON.parse(trimmed);
-        outputLine = JSON.stringify(entry);
-        key = `json:${stableJSONStringify(entry)}`;
-      } catch {
+      if (event.type === "json") {
+        outputLine = JSON.stringify(event.value);
+        key = `json:${stableJSONStringify(event.value)}`;
+      } else {
         core.warning(`mergeAppendOnlyJSONL: preserving unparseable line during merge`);
-        outputLine = trimmed;
-        key = `raw:${trimmed}`;
+        outputLine = event.rawLine.trim();
+        key = `raw:${outputLine}`;
       }
       if (!seen.has(key)) {
         seen.add(key);
@@ -560,21 +544,22 @@ async function main() {
         // Refresh baseRef and fetch the updated remote history so that
         // pushSignedCommits can resolve the new baseRef in git rev-list.
         try {
-          const { stdout: lsOut } = await exec.getExecOutput("git", ["ls-remote", "origin", `refs/heads/${branchName}`], { cwd: workspaceDir });
+          const gitEnv = { ...process.env, ...getGitAuthEnv(ghToken) };
+          const { stdout: lsOut } = await exec.getExecOutput("git", ["ls-remote", "origin", `refs/heads/${branchName}`], { cwd: workspaceDir, env: gitEnv, silent: true });
           const remoteHead = lsOut.trim().split(/\s+/)[0] || "";
           if (remoteHead && remoteHead !== currentBaseRef) {
-            currentBaseRef = remoteHead;
-            core.info(`Refreshed baseRef for retry: ${currentBaseRef}`);
             // Fetch the updated branch history into the local repo so pushSignedCommits
             // can resolve currentBaseRef in `git rev-list baseRef..HEAD`.
             try {
-              execGitSync(["fetch", "origin", `refs/heads/${branchName}`], { stdio: "pipe", cwd: workspaceDir, suppressLogs: true });
+              execGitSync(["fetch", "origin", `refs/heads/${branchName}`], { stdio: "pipe", cwd: workspaceDir, env: gitEnv, suppressLogs: true });
+              currentBaseRef = remoteHead;
+              core.info(`Refreshed baseRef for retry: ${currentBaseRef}`);
             } catch (fetchErr) {
               core.info(`Fetch of branch "${branchName}" on retry failed (non-fatal): ${getErrorMessage(fetchErr)}`);
             }
           }
-        } catch {
-          // ls-remote failed — ignored, keep existing baseRef.
+        } catch (remoteErr) {
+          core.warning(`Could not refresh baseRef for branch "${branchName}" on retry; keeping existing baseRef: ${getErrorMessage(remoteErr)}`);
         }
       } else {
         core.setFailed(`Failed to push ${stateLabel} after ${MAX_RETRIES + 1} attempts: ${errMsg}`);
